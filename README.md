@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo-no-background.png" alt="Nexa" width="120" />
+</p>
+
 # Nexa
 
 [![CI](https://github.com/nassime/Nexa-lang/actions/workflows/ci.yml/badge.svg)](https://github.com/nassime/Nexa-lang/actions/workflows/ci.yml)
