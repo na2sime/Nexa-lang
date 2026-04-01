@@ -1,0 +1,7 @@
+{
+  "name": "nexa-example-app",
+  "version": "0.1.0",
+  "author": "Nexa Team",
+  "main": "app.nexa",
+  "dependencies": []
+}

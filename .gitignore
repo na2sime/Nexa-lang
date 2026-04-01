@@ -1,0 +1,10 @@
+# Rust build artifacts
+/target/
+
+# Nexa compiler output (generated, never committed)
+dist/
+**/src/dist/
+**/src/.nexa/
+
+# macOS
+.DS_Store

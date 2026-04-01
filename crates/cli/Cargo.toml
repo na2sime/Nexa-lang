@@ -1,0 +1,22 @@
+[package]
+name = "nexa"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "nexa"
+path = "src/main.rs"
+
+[dependencies]
+nexa-compiler = { path = "../compiler" }
+nexa-server   = { path = "../server" }
+tokio         = { version = "1", features = ["full"] }
+clap          = { version = "4", features = ["derive"] }
+axum          = "0.7"
+serde         = { version = "1", features = ["derive"] }
+serde_json    = "1"
+serde_yaml    = "0.9"
+thiserror     = "1"
+
+[dev-dependencies]
+tempfile = "3"
