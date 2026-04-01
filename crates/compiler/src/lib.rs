@@ -1,17 +1,14 @@
-pub mod ast;
-pub mod codegen;
-pub mod lexer;
-pub mod parser;
-pub mod resolver;
-pub mod semantic;
-pub mod types;
+pub mod application;
+pub mod domain;
+pub mod infrastructure;
 
-pub use codegen::CodeGenerator;
-pub use parser::Parser;
-pub use resolver::Resolver;
-pub use semantic::SemanticAnalyzer;
+pub use application::services::codegen::CodeGenerator;
+pub use application::services::parser::Parser;
+pub use application::services::resolver::Resolver;
+pub use application::services::semantic::SemanticAnalyzer;
 
-use std::path::Path;
+use std::{fmt, path::Path};
+use crate::domain::span::Span;
 
 #[derive(Debug)]
 pub struct CompileResult {
@@ -19,50 +16,177 @@ pub struct CompileResult {
     pub js: String,
 }
 
+/// A compiler error with source location and rustc-style display.
+#[derive(Debug)]
+pub struct CompileError {
+    pub kind:   CompileErrorKind,
+    pub file:   Option<String>,
+    pub source: Option<String>,
+    pub span:   Span,
+}
+
+/// The underlying error from whichever compilation phase failed.
+#[derive(Debug)]
+pub enum CompileErrorKind {
+    Lex(application::services::lexer::LexError),
+    Parse(application::services::parser::ParseError),
+    Resolve(application::services::resolver::ResolveError),
+    Semantic(application::services::semantic::SemanticError),
+    Codegen(application::services::codegen::CodegenError),
+}
+
+impl fmt::Display for CompileErrorKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Lex(e)      => write!(f, "{e}"),
+            Self::Parse(e)    => write!(f, "{e}"),
+            Self::Resolve(e)  => write!(f, "{e}"),
+            Self::Semantic(e) => write!(f, "{e}"),
+            Self::Codegen(e)  => write!(f, "{e}"),
+        }
+    }
+}
+
+impl fmt::Display for CompileError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "error: {}", self.kind)?;
+        if let Some(file) = &self.file {
+            if !self.span.is_dummy() {
+                writeln!(f, "  --> {}:{}:{}", file, self.span.line, self.span.col)?;
+            } else {
+                writeln!(f, "  --> {}", file)?;
+            }
+        }
+        if let (Some(src), false) = (&self.source, self.span.is_dummy()) {
+            let line_idx  = self.span.line.saturating_sub(1) as usize;
+            let line_text = src.lines().nth(line_idx).unwrap_or("");
+            let pad       = format!("{}", self.span.line).len();
+            writeln!(f, "{:>pad$} |", "")?;
+            writeln!(f, "{} | {}", self.span.line, line_text)?;
+            let leading = self.span.col.saturating_sub(1) as usize;
+            let underln = "^".repeat(self.span.len.max(1) as usize);
+            writeln!(f, "{:>pad$} | {}{}", "", " ".repeat(leading), underln)?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for CompileError {}
+
 /// Pipeline commun : lex → parse → resolve → semantic → codegen.
 /// `entry` est utilisé pour résoudre les imports relatifs au fichier source.
 /// `resolver_root` est la racine de recherche pour les imports de packages.
+#[allow(clippy::result_large_err)]
 fn run_pipeline(
     source: &str,
     entry: &Path,
     resolver_root: &Path,
-) -> Result<CompileResult, Box<dyn std::error::Error>> {
-    let tokens = lexer::Lexer::new(source).tokenize()?;
-    let program = parser::Parser::new(tokens).parse()?;
-    let resolved = resolver::Resolver::new(resolver_root).resolve(&program, entry)?;
-    let mut analyzer = semantic::SemanticAnalyzer::new();
-    analyzer.analyze(&resolved)?;
-    Ok(codegen::CodeGenerator::new().generate(&resolved)?)
+) -> Result<CompileResult, CompileError> {
+    let file = entry.display().to_string();
+    let src  = source.to_string();
+
+    let tokens = application::services::lexer::Lexer::new(source).tokenize().map_err(|e| CompileError {
+        span: e.span(),
+        kind: CompileErrorKind::Lex(e),
+        file: Some(file.clone()),
+        source: Some(src.clone()),
+    })?;
+
+    let program = application::services::parser::Parser::new(tokens).parse().map_err(|e| CompileError {
+        span: e.span(),
+        kind: CompileErrorKind::Parse(e),
+        file: Some(file.clone()),
+        source: Some(src.clone()),
+    })?;
+
+    let resolved = application::services::resolver::Resolver::new(
+        resolver_root,
+        infrastructure::fs_source::FsSourceProvider,
+    ).resolve(&program, entry).map_err(|e| CompileError {
+        span: Span::dummy(),
+        kind: CompileErrorKind::Resolve(e),
+        file: Some(file.clone()),
+        source: None,
+    })?;
+
+    let mut analyzer = application::services::semantic::SemanticAnalyzer::new();
+    analyzer.analyze(&resolved).map_err(|e| CompileError {
+        span: e.span(),
+        kind: CompileErrorKind::Semantic(e),
+        file: Some(file.clone()),
+        source: Some(src.clone()),
+    })?;
+
+    application::services::codegen::CodeGenerator::new().generate(&resolved).map_err(|e| CompileError {
+        span: Span::dummy(),
+        kind: CompileErrorKind::Codegen(e),
+        file: Some(file.clone()),
+        source: None,
+    })
 }
 
-/// Compile un fichier `.nexa` standalone, en résolvant les imports
+/// Compile un fichier `.nx` standalone, en résolvant les imports
 /// relativement à son répertoire parent.
-pub fn compile_file(path: &Path) -> Result<CompileResult, Box<dyn std::error::Error>> {
-    let source = std::fs::read_to_string(path)?;
+#[allow(clippy::result_large_err)]
+pub fn compile_file(path: &Path) -> Result<CompileResult, CompileError> {
+    let source = std::fs::read_to_string(path).map_err(|e| CompileError {
+        span: Span::dummy(),
+        kind: CompileErrorKind::Resolve(application::services::resolver::ResolveError::Io(path.display().to_string(), e)),
+        file: Some(path.display().to_string()),
+        source: None,
+    })?;
     let root = path.parent().unwrap_or(Path::new("."));
     run_pipeline(&source, path, root)
 }
 
-/// Compile un fichier `.nexa` dans le contexte d'un projet structuré.
+/// Compile un fichier `.nx` dans le contexte d'un projet structuré.
 /// `src_root` = `<project>/src/` — racine du Resolver, permet de résoudre
 /// `libs/` en plus de `main/`.
+#[allow(clippy::result_large_err)]
 pub fn compile_project_file(
     entry: &Path,
     src_root: &Path,
-) -> Result<CompileResult, Box<dyn std::error::Error>> {
-    let source = std::fs::read_to_string(entry)?;
+) -> Result<CompileResult, CompileError> {
+    let source = std::fs::read_to_string(entry).map_err(|e| CompileError {
+        span: Span::dummy(),
+        kind: CompileErrorKind::Resolve(application::services::resolver::ResolveError::Io(entry.display().to_string(), e)),
+        file: Some(entry.display().to_string()),
+        source: None,
+    })?;
     run_pipeline(&source, entry, src_root)
 }
 
 /// Compile depuis une string (sans résolution d'imports).
-pub fn compile_str(source: &str) -> Result<CompileResult, Box<dyn std::error::Error>> {
-    // Pour compile_str, il n'y a pas de fichier réel : on utilise un chemin fictif
-    // et un resolver root vide. Les imports ne sont pas supportés.
-    let tokens = lexer::Lexer::new(source).tokenize()?;
-    let program = parser::Parser::new(tokens).parse()?;
-    let mut analyzer = semantic::SemanticAnalyzer::new();
-    analyzer.analyze(&program)?;
-    Ok(codegen::CodeGenerator::new().generate(&program)?)
+#[allow(clippy::result_large_err)]
+pub fn compile_str(source: &str) -> Result<CompileResult, CompileError> {
+    let tokens = application::services::lexer::Lexer::new(source).tokenize().map_err(|e| CompileError {
+        span: e.span(),
+        kind: CompileErrorKind::Lex(e),
+        file: None,
+        source: Some(source.to_string()),
+    })?;
+
+    let program = application::services::parser::Parser::new(tokens).parse().map_err(|e| CompileError {
+        span: e.span(),
+        kind: CompileErrorKind::Parse(e),
+        file: None,
+        source: Some(source.to_string()),
+    })?;
+
+    let mut analyzer = application::services::semantic::SemanticAnalyzer::new();
+    analyzer.analyze(&program).map_err(|e| CompileError {
+        span: e.span(),
+        kind: CompileErrorKind::Semantic(e),
+        file: None,
+        source: Some(source.to_string()),
+    })?;
+
+    application::services::codegen::CodeGenerator::new().generate(&program).map_err(|e| CompileError {
+        span: Span::dummy(),
+        kind: CompileErrorKind::Codegen(e),
+        file: None,
+        source: None,
+    })
 }
 
 #[cfg(test)]

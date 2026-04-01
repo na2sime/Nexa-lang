@@ -1,15 +1,26 @@
-use crate::ast::*;
-use crate::lexer::{Spanned, Token};
+use crate::domain::ast::*;
+use crate::application::services::lexer::{Spanned, Token};
+use crate::domain::span::Span;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum ParseError {
-    #[error("Unexpected token {0:?} at line {1}, col {2}")]
-    Unexpected(Token, usize, usize),
-    #[error("Expected {0} but got {1:?} at line {2}")]
-    Expected(String, Token, usize),
+    #[error("Unexpected token {0:?} at line {1:?}")]
+    Unexpected(Token, Span),
+    #[error("Expected {0} but got {1:?} at {2:?}")]
+    Expected(String, Token, Span),
     #[error("Unexpected end of file")]
     Eof,
+}
+
+impl ParseError {
+    pub fn span(&self) -> Span {
+        match self {
+            ParseError::Unexpected(_, s) => *s,
+            ParseError::Expected(_, _, s) => *s,
+            ParseError::Eof => Span::dummy(),
+        }
+    }
 }
 
 pub struct Parser {
@@ -44,7 +55,7 @@ impl Parser {
             self.advance();
             Ok(())
         } else {
-            Err(ParseError::Expected(format!("{expected:?}"), s.token, s.line))
+            Err(ParseError::Expected(format!("{expected:?}"), s.token, s.span))
         }
     }
 
@@ -54,7 +65,7 @@ impl Parser {
             self.advance();
             Ok(name)
         } else {
-            Err(ParseError::Expected("identifier".into(), s.token, s.line))
+            Err(ParseError::Expected("identifier".into(), s.token, s.span))
         }
     }
 
@@ -74,7 +85,7 @@ impl Parser {
         Ok(parts.join("."))
     }
 
-    // ── Entry point (a full .nexa file) ────────────────────────────────────
+    // ── Entry point (a full .nx file) ────────────────────────────────────
     pub fn parse(&mut self) -> Result<Program, ParseError> {
         let mut package = None;
         let mut imports = Vec::new();
@@ -114,7 +125,7 @@ impl Parser {
                 }
                 _ => {
                     let s = self.peek_spanned();
-                    return Err(ParseError::Unexpected(s.token, s.line, s.col));
+                    return Err(ParseError::Unexpected(s.token, s.span));
                 }
             }
         }
@@ -179,7 +190,7 @@ impl Parser {
             self.advance(); s
         } else {
             let s = self.peek_spanned();
-            return Err(ParseError::Expected("string literal".into(), s.token, s.line));
+            return Err(ParseError::Expected("string literal".into(), s.token, s.span));
         };
         self.expect(&Token::FatArrow)?;
         let target = self.expect_ident()?;
@@ -212,7 +223,7 @@ impl Parser {
             }
             _ => {
                 let s = self.peek_spanned();
-                Err(ParseError::Unexpected(s.token, s.line, s.col))
+                Err(ParseError::Unexpected(s.token, s.span))
             }
         }
     }
@@ -268,7 +279,7 @@ impl Parser {
             }
             _ => {
                 let s = self.peek_spanned();
-                Err(ParseError::Expected("type".into(), s.token, s.line))
+                Err(ParseError::Expected("type".into(), s.token, s.span))
             }
         }
     }
@@ -296,7 +307,7 @@ impl Parser {
             Token::Window    => { self.advance(); ClassKind::Window }
             _ => {
                 let s = self.peek_spanned();
-                return Err(ParseError::Unexpected(s.token, s.line, s.col));
+                return Err(ParseError::Unexpected(s.token, s.span));
             }
         };
         let name = self.expect_ident()?;
@@ -354,7 +365,7 @@ impl Parser {
                 }
                 _ => {
                     let s = self.peek_spanned();
-                    return Err(ParseError::Unexpected(s.token, s.line, s.col));
+                    return Err(ParseError::Unexpected(s.token, s.span));
                 }
             }
         }
@@ -541,11 +552,7 @@ impl Parser {
     fn parse_binary(&mut self, min_bp: u8) -> Result<Expr, ParseError> {
         let mut left = self.parse_unary()?;
 
-        loop {
-            let op = match self.token_to_binop() {
-                Some(op) => op,
-                None => break,
-            };
+        while let Some(op) = self.token_to_binop() {
             let (l_bp, r_bp) = op.binding_power();
             if l_bp < min_bp { break; }
             self.advance(); // consume operator
@@ -660,7 +667,7 @@ impl Parser {
 
             _ => {
                 let s = self.peek_spanned();
-                Err(ParseError::Unexpected(s.token, s.line, s.col))
+                Err(ParseError::Unexpected(s.token, s.span))
             }
         }
     }

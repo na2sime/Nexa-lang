@@ -6,7 +6,7 @@
 
 **Nexa** is a statically-typed language that compiles to HTML + JavaScript. It lets you describe full-stack web applications — server config, data models, UI components, and routes — in a single, readable syntax.
 
-```nexa
+```nx
 package com.myapp;
 
 app App {
@@ -34,8 +34,9 @@ app App {
 - **Components & Windows** — declarative UI primitives that compile to DOM calls
 - **Package system** — `import models.User` resolves across `src/main/` and `src/libs/`
 - **Built-in routing** — `route "/" => HomePage` maps URLs to window classes
-- **Integrated dev server** — `nexa run` compiles and serves with live reload-ready output
-- **Project structure** — standardized layout enforced by the CLI (like a Node.js project)
+- **Integrated dev server** — `nexa run` compiles and serves with live reload
+- **Watch mode** — `nexa run --watch` recompiles and reloads the browser on every save
+- **Project structure** — standardized layout enforced by the CLI
 
 ---
 
@@ -77,7 +78,7 @@ my-app/
   nexa-compiler.yaml
   src/
     main/
-      app.nexa
+      app.nx
 ```
 
 **`project.json`**
@@ -86,7 +87,7 @@ my-app/
   "name": "my-app",
   "version": "0.1.0",
   "author": "Your Name",
-  "main": "app.nexa",
+  "main": "app.nx",
   "dependencies": []
 }
 ```
@@ -96,8 +97,8 @@ my-app/
 version: "0.1"
 ```
 
-**`src/main/app.nexa`**
-```nexa
+**`src/main/app.nx`**
+```nx
 package com.myapp;
 
 app App {
@@ -122,7 +123,14 @@ nexa run
 # → Nexa dev server → http://localhost:3000
 ```
 
-### 3. Build for production
+### 3. Watch mode (HMR)
+
+```bash
+nexa run --watch
+# Recompiles and reloads the browser on every .nx save
+```
+
+### 4. Build for production
 
 ```bash
 nexa build
@@ -137,17 +145,17 @@ Output: `src/dist/index.html` + `src/dist/app.js`.
 
 ### Types
 
-| Nexa    | JavaScript equivalent |
-|---------|----------------------|
-| `String`  | `string`             |
-| `Int`     | `number`             |
-| `Bool`    | `boolean`            |
-| `List<T>` | `T[]`                |
-| `Void`    | `void`               |
+| Nexa      | JavaScript equivalent |
+|-----------|-----------------------|
+| `String`  | `string`              |
+| `Int`     | `number`              |
+| `Bool`    | `boolean`             |
+| `List<T>` | `T[]`                 |
+| `Void`    | `void`                |
 
 ### Classes
 
-```nexa
+```nx
 public class User {
   String name;
   Int age;
@@ -165,7 +173,7 @@ public class User {
 
 ### Interfaces
 
-```nexa
+```nx
 public interface Repository<T> {
   findAll() => List<T>;
 }
@@ -175,7 +183,7 @@ public interface Repository<T> {
 
 Reusable UI elements that render DOM nodes:
 
-```nexa
+```nx
 public component UserCard {
   private String name;
 
@@ -195,7 +203,7 @@ public component UserCard {
 
 Full-page views mapped to routes:
 
-```nexa
+```nx
 public window AboutPage {
   public render() => Component {
     return Page {
@@ -208,34 +216,34 @@ public window AboutPage {
 
 ### UI Primitives
 
-| Primitive               | Description                  |
-|-------------------------|------------------------------|
-| `Page { ... }`          | Root page container          |
-| `Column { ... }`        | Vertical flex container      |
-| `Row { ... }`           | Horizontal flex container    |
-| `Heading(text)`         | `<h1>` heading               |
-| `Paragraph(text)`       | `<p>` paragraph              |
-| `Text(content)`         | Inline text node             |
-| `Button(label, onClick)`| Clickable button             |
-| `Input(placeholder, onChange)` | Text input field    |
+| Primitive                      | Description               |
+|--------------------------------|---------------------------|
+| `Page { ... }`                 | Root page container       |
+| `Column { ... }`               | Vertical flex container   |
+| `Row { ... }`                  | Horizontal flex container |
+| `Heading(text)`                | `<h1>` heading            |
+| `Paragraph(text)`              | `<p>` paragraph           |
+| `Text(content)`                | Inline text node          |
+| `Button(label, onClick)`       | Clickable button          |
+| `Input(placeholder, onChange)` | Text input field          |
 
 ### Routing
 
-```nexa
-route "/"       => HomePage;
-route "/about"  => AboutPage;
+```nx
+route "/"      => HomePage;
+route "/about" => AboutPage;
 ```
 
 ### Imports
 
-```nexa
-import models.User;               // → src/main/models/User.nexa
-import libs.validation.Validator; // → src/libs/validation/Validator.nexa
+```nx
+import models.User;               // → src/main/models/User.nx
+import libs.validation.Validator; // → src/libs/validation/Validator.nx
 ```
 
 ### Control flow
 
-```nexa
+```nx
 if (count > 0) {
   return Page { Heading("Items found") };
 } else {
@@ -254,11 +262,11 @@ my-app/
 ├── project.json          # Project metadata (name, version, author, main)
 ├── nexa-compiler.yaml    # Compiler configuration
 └── src/
-    ├── main/             # Source .nexa files (required)
-    │   └── app.nexa      # Entry point declared in project.json
+    ├── main/             # Source .nx files (required)
+    │   └── app.nx        # Entry point declared in project.json
     ├── libs/             # Reusable libraries (auto-created)
     ├── test/             # Future: unit tests (auto-created)
-    ├── .nexa/            # Compiler internals / logs (auto-created, gitignored)
+    ├── .nexa/            # Compiler internals / cache (auto-created, gitignored)
     └── dist/             # Compiler output (auto-created, gitignored)
         ├── index.html
         └── app.js
@@ -269,29 +277,41 @@ my-app/
 ## CLI Reference
 
 ```
-nexa run    [--project <dir>] [--port <port>]   Compile + start dev server
-nexa build  [--project <dir>]                   Compile to src/dist/
+nexa run    [--project <dir>] [--port <port>] [--watch]   Compile + start dev server
+nexa build  [--project <dir>]                             Compile to src/dist/
 ```
 
-`--project` defaults to the current directory.
+`--project` defaults to the current directory.  
+`--watch` enables hot-module reload via WebSocket.
 
 ---
 
 ## Architecture
 
-Nexa is a Rust workspace with three crates:
+Nexa is a Rust workspace with three crates, each following Clean Architecture (domain / application / infrastructure / interfaces):
 
 ```
 crates/
-├── compiler/   Lexer → Parser → Resolver → Semantic → Codegen
-├── cli/        CLI (clap), project loading, file I/O
-└── server/     Axum-based dev server
+├── compiler/
+│   ├── domain/          AST nodes, Span value object
+│   ├── application/
+│   │   ├── ports/       SourceProvider trait (filesystem abstraction)
+│   │   └── services/    Lexer, Parser, Resolver, SemanticAnalyzer, CodeGenerator
+│   └── infrastructure/  FsSourceProvider (prod), MemSourceProvider (tests)
+│
+├── cli/
+│   ├── application/     NexaProject config loading, build/run/watch commands
+│   └── interfaces/      Clap CLI definition (Cli, Commands)
+│
+└── server/
+    ├── application/     AppState, SharedState, HMR broadcast
+    └── interfaces/      Axum routes (/, /app.js, /ws WebSocket)
 ```
 
 **Compilation pipeline:**
 
 ```
-.nexa source
+.nx source
     │
     ▼
 Lexer           tokenise source into a flat token stream
@@ -300,7 +320,7 @@ Lexer           tokenise source into a flat token stream
 Parser          build a typed AST (Program, ClassDecl, Expr, …)
     │
     ▼
-Resolver        load imported files, merge declarations, detect cycles
+Resolver        load imported .nx files, merge declarations, detect cycles
     │
     ▼
 SemanticAnalyzer check types, undefined references, route targets
@@ -320,11 +340,12 @@ Contributions are welcome! Please read [CONTRIBUTING.md](CONTRIBUTING.md) first.
 ## Roadmap
 
 - [ ] `nexa init` scaffold command
-- [ ] Watch mode (`nexa run --watch`)
+- [x] Watch mode (`nexa run --watch`) with HMR via WebSocket
+- [x] Error spans with rustc-style source locations
+- [x] Clean Architecture (domain / application / infrastructure / interfaces)
 - [ ] Dependency resolution via `dependencies` in `project.json`
 - [ ] Unit test runner (`nexa test`)
 - [ ] Standard library (`std/`)
-- [ ] Error spans with source locations
 - [ ] Language Server Protocol (LSP) support
 
 ---

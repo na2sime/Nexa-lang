@@ -1,11 +1,8 @@
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub enum Visibility {
     Public,
+    #[default]
     Private,
-}
-
-impl Default for Visibility {
-    fn default() -> Self { Visibility::Private }
 }
 
 #[derive(Debug, Clone, PartialEq)]

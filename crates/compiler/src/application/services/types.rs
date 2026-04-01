@@ -1,4 +1,4 @@
-use crate::ast::Type;
+use crate::domain::ast::Type;
 
 pub fn type_to_js(ty: &Type) -> String {
     match ty {

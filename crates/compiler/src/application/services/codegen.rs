@@ -1,4 +1,4 @@
-use crate::ast::*;
+use crate::domain::ast::*;
 use crate::CompileResult;
 use thiserror::Error;
 
@@ -192,7 +192,7 @@ impl CodeGenerator {
       margin: 0 auto;
       padding: 2rem 1.5rem;
     }}
-    .nexa-page {{
+    .nx-page {{
       display: flex;
       flex-direction: column;
       gap: 1rem;
@@ -256,7 +256,7 @@ function Row(children) {
 
 function Page(children) {
   const el = document.createElement("main");
-  el.className = "nexa-page";
+  el.className = "nx-page";
   _appendAll(el, children);
   return el;
 }

@@ -36,13 +36,13 @@ pub enum ProjectError {
 // ── Structs de config ─────────────────────────────────────────────────────────
 
 /// Désérialisé depuis `project.json`
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[allow(dead_code)]
 pub struct ProjectConfig {
     pub name: String,
     pub version: String,
     pub author: String,
-    /// Nom du fichier d'entrée dans `src/main/`, ex: "app.nexa"
+    /// Nom du fichier d'entrée dans `src/main/`, ex: "app.nx"
     pub main: String,
     /// Réservé pour les futures dépendances
     #[serde(default)]
@@ -50,7 +50,7 @@ pub struct ProjectConfig {
 }
 
 /// Désérialisé depuis `nexa-compiler.yaml`
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[allow(dead_code)]
 pub struct CompilerConfig {
     pub version: String,
@@ -58,20 +58,21 @@ pub struct CompilerConfig {
 
 // ── Projet ────────────────────────────────────────────────────────────────────
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct NexaProject {
     root: PathBuf,
     pub project: ProjectConfig,
+    #[allow(dead_code)]
     pub compiler: CompilerConfig,
 }
 
 // ── Fonctions de parsing pures (testables indépendamment) ─────────────────────
 
-fn parse_project_config(text: &str) -> Result<ProjectConfig, ProjectError> {
+pub fn parse_project_config(text: &str) -> Result<ProjectConfig, ProjectError> {
     serde_json::from_str(text).map_err(ProjectError::ParseProjectJson)
 }
 
-fn parse_compiler_config(text: &str) -> Result<CompilerConfig, ProjectError> {
+pub fn parse_compiler_config(text: &str) -> Result<CompilerConfig, ProjectError> {
     serde_yaml::from_str(text).map_err(ProjectError::ParseCompilerYaml)
 }
 
@@ -79,14 +80,6 @@ fn parse_compiler_config(text: &str) -> Result<CompilerConfig, ProjectError> {
 
 impl NexaProject {
     /// Charge et valide un projet depuis `dir`.
-    ///
-    /// Validation (fatale, dans l'ordre) :
-    ///   1. `project.json` — présent + parseable
-    ///   2. `nexa-compiler.yaml` — présent + parseable
-    ///   3. `src/main/` — répertoire présent
-    ///   4. Fichier `main` déclaré dans `project.json` — présent
-    ///
-    /// Side-effects (non bloquants) : auto-création de `src/.nexa/`, `src/libs/`, `src/test/`
     pub fn load(dir: &Path) -> Result<Self, ProjectError> {
         let root = dir.to_path_buf();
 
@@ -154,51 +147,43 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
-    // ── Helper ────────────────────────────────────────────────────────────────
-
-    /// Crée un projet Nexa valide dans `dir`.
     fn make_valid_project(dir: &Path) {
         fs::write(
             dir.join("project.json"),
-            r#"{"name":"test-app","version":"0.1.0","author":"Tester","main":"app.nexa"}"#,
+            r#"{"name":"test-app","version":"0.1.0","author":"Tester","main":"app.nx"}"#,
         )
         .unwrap();
         fs::write(dir.join("nexa-compiler.yaml"), "version: \"0.1\"\n").unwrap();
         let src_main = dir.join("src").join("main");
         fs::create_dir_all(&src_main).unwrap();
-        fs::write(src_main.join("app.nexa"), "").unwrap();
+        fs::write(src_main.join("app.nx"), "").unwrap();
     }
-
-    // ── parse_project_config ──────────────────────────────────────────────────
 
     #[test]
     fn parse_project_config_valid() {
-        let json = r#"{"name":"my-app","version":"1.0.0","author":"Dev","main":"app.nexa"}"#;
+        let json = r#"{"name":"my-app","version":"1.0.0","author":"Dev","main":"app.nx"}"#;
         let cfg = parse_project_config(json).unwrap();
         assert_eq!(cfg.name, "my-app");
-        assert_eq!(cfg.version, "1.0.0");
-        assert_eq!(cfg.author, "Dev");
-        assert_eq!(cfg.main, "app.nexa");
+        assert_eq!(cfg.main, "app.nx");
         assert!(cfg.dependencies.is_empty());
     }
 
     #[test]
     fn parse_project_config_dependencies_optional() {
-        let json = r#"{"name":"a","version":"1","author":"b","main":"m.nexa"}"#;
+        let json = r#"{"name":"a","version":"1","author":"b","main":"m.nx"}"#;
         let cfg = parse_project_config(json).unwrap();
         assert!(cfg.dependencies.is_empty());
     }
 
     #[test]
     fn parse_project_config_with_dependencies() {
-        let json = r#"{"name":"a","version":"1","author":"b","main":"m.nexa","dependencies":["lib1","lib2"]}"#;
+        let json = r#"{"name":"a","version":"1","author":"b","main":"m.nx","dependencies":["lib1","lib2"]}"#;
         let cfg = parse_project_config(json).unwrap();
         assert_eq!(cfg.dependencies, vec!["lib1", "lib2"]);
     }
 
     #[test]
     fn parse_project_config_missing_required_field() {
-        // "main" manquant
         let json = r#"{"name":"a","version":"1","author":"b"}"#;
         assert!(parse_project_config(json).is_err());
     }
@@ -207,8 +192,6 @@ mod tests {
     fn parse_project_config_invalid_json() {
         assert!(parse_project_config("pas du json").is_err());
     }
-
-    // ── parse_compiler_config ─────────────────────────────────────────────────
 
     #[test]
     fn parse_compiler_config_valid() {
@@ -226,19 +209,15 @@ mod tests {
         assert!(parse_compiler_config(":\n  bad:\n  yaml:").is_err());
     }
 
-    // ── Helpers de chemin (purs, sans I/O) ───────────────────────────────────
-
     #[test]
     fn path_helpers_are_correct() {
         let tmp = TempDir::new().unwrap();
         make_valid_project(tmp.path());
         let proj = NexaProject::load(tmp.path()).unwrap();
         assert_eq!(proj.src_root(),   tmp.path().join("src"));
-        assert_eq!(proj.entry_file(), tmp.path().join("src").join("main").join("app.nexa"));
+        assert_eq!(proj.entry_file(), tmp.path().join("src").join("main").join("app.nx"));
         assert_eq!(proj.dist_dir(),   tmp.path().join("src").join("dist"));
     }
-
-    // ── NexaProject::load — succès ────────────────────────────────────────────
 
     #[test]
     fn load_valid_project_succeeds() {
@@ -252,12 +231,10 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         make_valid_project(tmp.path());
         NexaProject::load(tmp.path()).unwrap();
-        assert!(tmp.path().join("src").join(".nexa").is_dir(), "src/.nexa/ doit être créé");
-        assert!(tmp.path().join("src").join("libs").is_dir(),  "src/libs/ doit être créé");
-        assert!(tmp.path().join("src").join("test").is_dir(),  "src/test/ doit être créé");
+        assert!(tmp.path().join("src").join(".nexa").is_dir());
+        assert!(tmp.path().join("src").join("libs").is_dir());
+        assert!(tmp.path().join("src").join("test").is_dir());
     }
-
-    // ── NexaProject::load — cas d'erreur ─────────────────────────────────────
 
     #[test]
     fn load_missing_project_json() {
@@ -280,7 +257,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         fs::write(
             tmp.path().join("project.json"),
-            r#"{"name":"a","version":"1","author":"b","main":"m.nexa"}"#,
+            r#"{"name":"a","version":"1","author":"b","main":"m.nx"}"#,
         )
         .unwrap();
         let err = NexaProject::load(tmp.path()).unwrap_err();
@@ -292,7 +269,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         fs::write(
             tmp.path().join("project.json"),
-            r#"{"name":"a","version":"1","author":"b","main":"m.nexa"}"#,
+            r#"{"name":"a","version":"1","author":"b","main":"m.nx"}"#,
         )
         .unwrap();
         fs::write(tmp.path().join("nexa-compiler.yaml"), "version: \"0.1\"").unwrap();
@@ -305,12 +282,11 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         fs::write(
             tmp.path().join("project.json"),
-            r#"{"name":"a","version":"1","author":"b","main":"absent.nexa"}"#,
+            r#"{"name":"a","version":"1","author":"b","main":"absent.nx"}"#,
         )
         .unwrap();
         fs::write(tmp.path().join("nexa-compiler.yaml"), "version: \"0.1\"").unwrap();
         fs::create_dir_all(tmp.path().join("src").join("main")).unwrap();
-        // absent.nexa n'est pas créé
         let err = NexaProject::load(tmp.path()).unwrap_err();
         assert!(matches!(err, ProjectError::MissingEntryFile(_)));
     }

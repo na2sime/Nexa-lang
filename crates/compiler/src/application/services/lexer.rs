@@ -1,3 +1,4 @@
+use crate::domain::span::Span;
 use thiserror::Error;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -75,16 +76,24 @@ pub enum Token {
 #[derive(Debug, Clone)]
 pub struct Spanned {
     pub token: Token,
-    pub line: usize,
-    pub col: usize,
+    pub span: Span,
 }
 
 #[derive(Debug, Error)]
 pub enum LexError {
-    #[error("Unexpected character '{0}' at line {1}, col {2}")]
-    UnexpectedChar(char, usize, usize),
-    #[error("Unterminated string at line {0}")]
-    UnterminatedString(usize),
+    #[error("Unexpected character '{0}' at line {}, col {}", .1.line, .1.col)]
+    UnexpectedChar(char, Span),
+    #[error("Unterminated string at line {}", .0.line)]
+    UnterminatedString(Span),
+}
+
+impl LexError {
+    pub fn span(&self) -> Span {
+        match self {
+            LexError::UnexpectedChar(_, s) => *s,
+            LexError::UnterminatedString(s) => *s,
+        }
+    }
 }
 
 pub struct Lexer {
@@ -133,11 +142,14 @@ impl Lexer {
 
     fn read_string(&mut self) -> Result<Token, LexError> {
         let line = self.line;
-        self.advance(); // consume "
+        let start_col = self.col;
+        self.advance(); // consume opening "
         let mut s = String::new();
         loop {
             match self.peek() {
-                None | Some('\n') => return Err(LexError::UnterminatedString(line)),
+                None | Some('\n') => {
+                    return Err(LexError::UnterminatedString(Span::new(line as u32, start_col as u32, 1)));
+                }
                 Some('"') => { self.advance(); return Ok(Token::StringLit(s)); }
                 Some('\\') => {
                     self.advance();
@@ -210,70 +222,72 @@ impl Lexer {
             let line = self.line;
             let col = self.col;
 
-            match self.peek() {
-                None => { tokens.push(Spanned { token: Token::Eof, line, col }); break; }
-                Some('"') => {
-                    let tok = self.read_string()?;
-                    tokens.push(Spanned { token: tok, line, col });
+            let tok = match self.peek() {
+                None => {
+                    tokens.push(Spanned { token: Token::Eof, span: Span::new(line as u32, col as u32, 0) });
+                    break;
                 }
-                Some(c) if c.is_ascii_digit() => {
-                    let tok = self.read_number();
-                    tokens.push(Spanned { token: tok, line, col });
-                }
-                Some(c) if c.is_alphabetic() || c == '_' => {
-                    let tok = self.read_ident_or_keyword();
-                    tokens.push(Spanned { token: tok, line, col });
-                }
-                Some('{') => { self.advance(); tokens.push(Spanned { token: Token::LBrace,     line, col }); }
-                Some('}') => { self.advance(); tokens.push(Spanned { token: Token::RBrace,     line, col }); }
-                Some('(') => { self.advance(); tokens.push(Spanned { token: Token::LParen,     line, col }); }
-                Some(')') => { self.advance(); tokens.push(Spanned { token: Token::RParen,     line, col }); }
-                Some(';') => { self.advance(); tokens.push(Spanned { token: Token::Semicolon,  line, col }); }
-                Some(':') => { self.advance(); tokens.push(Spanned { token: Token::Colon,      line, col }); }
-                Some(',') => { self.advance(); tokens.push(Spanned { token: Token::Comma,      line, col }); }
-                Some('.') => { self.advance(); tokens.push(Spanned { token: Token::Dot,        line, col }); }
-                Some('+') => { self.advance(); tokens.push(Spanned { token: Token::Plus,       line, col }); }
-                Some('-') => { self.advance(); tokens.push(Spanned { token: Token::Minus,      line, col }); }
-                Some('*') => { self.advance(); tokens.push(Spanned { token: Token::Star,       line, col }); }
-                Some('%') => { self.advance(); tokens.push(Spanned { token: Token::Percent,    line, col }); }
+                Some('"') => self.read_string()?,
+                Some(c) if c.is_ascii_digit() => self.read_number(),
+                Some(c) if c.is_alphabetic() || c == '_' => self.read_ident_or_keyword(),
+                Some('{') => { self.advance(); Token::LBrace }
+                Some('}') => { self.advance(); Token::RBrace }
+                Some('(') => { self.advance(); Token::LParen }
+                Some(')') => { self.advance(); Token::RParen }
+                Some(';') => { self.advance(); Token::Semicolon }
+                Some(':') => { self.advance(); Token::Colon }
+                Some(',') => { self.advance(); Token::Comma }
+                Some('.') => { self.advance(); Token::Dot }
+                Some('+') => { self.advance(); Token::Plus }
+                Some('-') => { self.advance(); Token::Minus }
+                Some('*') => { self.advance(); Token::Star }
+                Some('%') => { self.advance(); Token::Percent }
                 Some('=') => {
                     self.advance();
-                    if self.peek() == Some('>') { self.advance(); tokens.push(Spanned { token: Token::FatArrow, line, col }); }
-                    else if self.peek() == Some('=') { self.advance(); tokens.push(Spanned { token: Token::EqualEqual, line, col }); }
-                    else { tokens.push(Spanned { token: Token::Equals, line, col }); }
+                    if self.peek() == Some('>') { self.advance(); Token::FatArrow }
+                    else if self.peek() == Some('=') { self.advance(); Token::EqualEqual }
+                    else { Token::Equals }
                 }
                 Some('!') => {
                     self.advance();
-                    if self.peek() == Some('=') { self.advance(); tokens.push(Spanned { token: Token::BangEqual, line, col }); }
-                    else { tokens.push(Spanned { token: Token::Bang, line, col }); }
+                    if self.peek() == Some('=') { self.advance(); Token::BangEqual }
+                    else { Token::Bang }
                 }
                 Some('<') => {
                     self.advance();
-                    if self.peek() == Some('=') { self.advance(); tokens.push(Spanned { token: Token::LessEqual, line, col }); }
-                    else { tokens.push(Spanned { token: Token::LAngle, line, col }); }
+                    if self.peek() == Some('=') { self.advance(); Token::LessEqual }
+                    else { Token::LAngle }
                 }
                 Some('>') => {
                     self.advance();
-                    if self.peek() == Some('=') { self.advance(); tokens.push(Spanned { token: Token::GreaterEqual, line, col }); }
-                    else { tokens.push(Spanned { token: Token::RAngle, line, col }); }
+                    if self.peek() == Some('=') { self.advance(); Token::GreaterEqual }
+                    else { Token::RAngle }
                 }
                 Some('&') => {
                     self.advance();
-                    if self.peek() == Some('&') { self.advance(); tokens.push(Spanned { token: Token::And, line, col }); }
-                    else { return Err(LexError::UnexpectedChar('&', line, col)); }
+                    if self.peek() == Some('&') { self.advance(); Token::And }
+                    else {
+                        return Err(LexError::UnexpectedChar('&', Span::new(line as u32, col as u32, 1)));
+                    }
                 }
                 Some('|') => {
                     self.advance();
-                    if self.peek() == Some('|') { self.advance(); tokens.push(Spanned { token: Token::Or, line, col }); }
-                    else { return Err(LexError::UnexpectedChar('|', line, col)); }
+                    if self.peek() == Some('|') { self.advance(); Token::Or }
+                    else {
+                        return Err(LexError::UnexpectedChar('|', Span::new(line as u32, col as u32, 1)));
+                    }
                 }
                 Some('/') => {
                     self.advance();
                     // single slash as division operator (comments already handled above)
-                    tokens.push(Spanned { token: Token::Slash, line, col });
+                    Token::Slash
                 }
-                Some(c) => return Err(LexError::UnexpectedChar(c, line, col)),
-            }
+                Some(c) => {
+                    return Err(LexError::UnexpectedChar(c, Span::new(line as u32, col as u32, 1)));
+                }
+            };
+            let len = (self.col as u32).saturating_sub(col as u32);
+            tokens.push(Spanned { token: tok, span: Span::new(line as u32, col as u32, len) });
         }
         Ok(tokens)
     }

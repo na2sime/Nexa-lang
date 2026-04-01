@@ -6,22 +6,35 @@
 //!   - Routes point to Window declarations
 //!   - Imported symbols exist (names only — full type-checking is future work)
 
-use crate::ast::*;
+use crate::domain::ast::*;
+use crate::domain::span::Span;
 use std::collections::{HashMap, HashSet};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum SemanticError {
-    #[error("Undefined type: '{0}'")]
-    UndefinedType(String),
-    #[error("Duplicate declaration: '{0}'")]
-    Duplicate(String),
-    #[error("Route target '{0}' is not a window")]
-    NotAWindow(String),
-    #[error("Import '{0}' refers to unknown symbol")]
-    UnknownImport(String),
-    #[error("Symbol '{0}' is not public and cannot be imported")]
-    NotPublic(String),
+    #[error("Undefined type '{name}'")]
+    UndefinedType { name: String, span: Span },
+    #[error("Duplicate declaration '{name}'")]
+    Duplicate { name: String, span: Span },
+    #[error("Route target '{name}' is not a window")]
+    NotAWindow { name: String, span: Span },
+    #[error("Import '{path}' refers to unknown symbol")]
+    UnknownImport { path: String, span: Span },
+    #[error("Symbol '{name}' is not public and cannot be imported")]
+    NotPublic { name: String, span: Span },
+}
+
+impl SemanticError {
+    pub fn span(&self) -> Span {
+        match self {
+            SemanticError::UndefinedType { span, .. } => *span,
+            SemanticError::Duplicate { span, .. } => *span,
+            SemanticError::NotAWindow { span, .. } => *span,
+            SemanticError::UnknownImport { span, .. } => *span,
+            SemanticError::NotPublic { span, .. } => *span,
+        }
+    }
 }
 
 pub struct SemanticAnalyzer {
@@ -40,13 +53,19 @@ impl SemanticAnalyzer {
             match decl {
                 Declaration::Class(cls) => {
                     if self.classes.contains_key(&cls.name) {
-                        return Err(SemanticError::Duplicate(cls.name.clone()));
+                        return Err(SemanticError::Duplicate {
+                            name: cls.name.clone(),
+                            span: Span::dummy(),
+                        });
                     }
                     self.classes.insert(cls.name.clone(), cls.clone());
                 }
                 Declaration::Interface(iface) => {
                     if self.interfaces.contains_key(&iface.name) {
-                        return Err(SemanticError::Duplicate(iface.name.clone()));
+                        return Err(SemanticError::Duplicate {
+                            name: iface.name.clone(),
+                            span: Span::dummy(),
+                        });
                     }
                     self.interfaces.insert(iface.name.clone(), iface.clone());
                 }
@@ -69,14 +88,20 @@ impl SemanticAnalyzer {
             .collect();
 
         for import in &program.imports {
-            let symbol = import.path.split('.').last().unwrap_or("");
+            let symbol = import.path.split('.').next_back().unwrap_or("");
             if !all_names.contains(symbol) {
-                return Err(SemanticError::UnknownImport(import.path.clone()));
+                return Err(SemanticError::UnknownImport {
+                    path: import.path.clone(),
+                    span: Span::dummy(),
+                });
             }
             // Check it's public
             if let Some(cls) = self.classes.get(symbol) {
                 if cls.visibility != Visibility::Public {
-                    return Err(SemanticError::NotPublic(symbol.to_string()));
+                    return Err(SemanticError::NotPublic {
+                        name: symbol.to_string(),
+                        span: Span::dummy(),
+                    });
                 }
             }
         }
@@ -84,9 +109,15 @@ impl SemanticAnalyzer {
         // ── Pass 4: validate routes ─────────────────────────────────────────
         for route in &program.routes {
             match self.classes.get(&route.target) {
-                None => return Err(SemanticError::UndefinedType(route.target.clone())),
+                None => return Err(SemanticError::UndefinedType {
+                    name: route.target.clone(),
+                    span: Span::dummy(),
+                }),
                 Some(cls) if cls.kind != ClassKind::Window => {
-                    return Err(SemanticError::NotAWindow(route.target.clone()));
+                    return Err(SemanticError::NotAWindow {
+                        name: route.target.clone(),
+                        span: Span::dummy(),
+                    });
                 }
                 _ => {}
             }
@@ -98,12 +129,18 @@ impl SemanticAnalyzer {
     fn check_class(&self, cls: &ClassDecl) -> Result<(), SemanticError> {
         if let Some(parent) = &cls.extends {
             if !self.classes.contains_key(parent) {
-                return Err(SemanticError::UndefinedType(parent.clone()));
+                return Err(SemanticError::UndefinedType {
+                    name: parent.clone(),
+                    span: Span::dummy(),
+                });
             }
         }
         for iface in &cls.implements {
             if !self.interfaces.contains_key(iface) {
-                return Err(SemanticError::UndefinedType(iface.clone()));
+                return Err(SemanticError::UndefinedType {
+                    name: iface.clone(),
+                    span: Span::dummy(),
+                });
             }
         }
         Ok(())
