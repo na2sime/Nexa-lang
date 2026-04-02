@@ -34,30 +34,28 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Linux — native runners (no cross/Docker needed), static musl binaries
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
             asset: nexa-linux-x86_64
-            use_cross: true
 
-          - os: ubuntu-latest
+          - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
             asset: nexa-linux-aarch64
-            use_cross: true
 
+          # macOS
           - os: macos-13
             target: x86_64-apple-darwin
             asset: nexa-macos-x86_64
-            use_cross: false
 
           - os: macos-latest
             target: aarch64-apple-darwin
             asset: nexa-macos-aarch64
-            use_cross: false
 
+          # Windows
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             asset: nexa-windows-x86_64
-            use_cross: false
 
     steps:
       - name: Checkout
@@ -67,6 +65,10 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+
+      - name: Install musl tools (Linux)
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get install -y musl-tools
 
       - name: Cache cargo
         uses: actions/cache@v4
@@ -78,16 +80,7 @@ jobs:
           key: snapshot-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: snapshot-${{ matrix.target }}-
 
-      - name: Install cross
-        if: matrix.use_cross
-        run: cargo install cross --locked
-
-      - name: Build nexa (cross)
-        if: matrix.use_cross
-        run: cross build --release --locked --bin nexa --target ${{ matrix.target }}
-
-      - name: Build nexa (native)
-        if: "!matrix.use_cross"
+      - name: Build nexa
         run: cargo build --release --locked --bin nexa --target ${{ matrix.target }}
 
       - name: Create archive (Unix)
