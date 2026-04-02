@@ -71,6 +71,12 @@ enum Commands {
         #[arg(short, long, value_name = "DIR")]
         project: Option<PathBuf>,
     },
+    /// Met à jour le CLI Nexa vers la dernière version
+    Update {
+        /// Canal de mise à jour (stable | snapshot | latest)
+        #[arg(long, value_name = "CHANNEL")]
+        channel: Option<String>,
+    },
 }
 
 pub async fn run() {
@@ -85,5 +91,6 @@ pub async fn run() {
         Commands::Login { registry }            => commands::login(registry),
         Commands::Publish { project, registry } => commands::publish(project, registry),
         Commands::Install { package, project }  => commands::install(package, project),
+        Commands::Update  { channel }           => commands::update(channel),
     }
 }

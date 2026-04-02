@@ -1,4 +1,4 @@
-use crate::application::{credentials, project::NexaProject};
+use crate::application::{credentials, project::NexaProject, updater};
 use nexa_compiler::{compile_project_file, compile_to_bundle, decode_nxb, CodeGenerator};
 use nexa_server::{AppState, build_router};
 use notify::{Config as WatchConfig, Event, RecommendedWatcher, RecursiveMode, Watcher};
@@ -17,6 +17,7 @@ pub fn load_project(dir: Option<PathBuf>) -> NexaProject {
 }
 
 pub fn build(project_dir: Option<PathBuf>) {
+    updater::check_and_notify("stable");
     let proj = load_project(project_dir);
     println!("Compiling {} ...", proj.entry_file().display());
     match compile_project_file(&proj.entry_file(), &proj.src_root()) {
@@ -557,4 +558,10 @@ pub fn write_dist(dist_dir: &Path, result: nexa_compiler::CompileResult) {
     fs::write(dist_dir.join("index.html"), &result.html).expect("cannot write index.html");
     fs::write(dist_dir.join("app.js"),     &result.js).expect("cannot write app.js");
     println!("Build OK → {}", dist_dir.display());
+}
+
+// ── Update ────────────────────────────────────────────────────────────────────
+
+pub fn update(channel_override: Option<String>) {
+    updater::run_update_command(channel_override);
 }
