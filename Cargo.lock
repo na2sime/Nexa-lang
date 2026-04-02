@@ -1594,11 +1594,13 @@ dependencies = [
  "jsonwebtoken",
  "serde",
  "serde_json",
+ "sha2",
  "sqlx",
  "thiserror 1.0.69",
  "tokio",
  "tower-http 0.5.2",
  "uuid",
+ "zip",
 ]
 
 [[package]]

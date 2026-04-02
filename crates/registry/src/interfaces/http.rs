@@ -127,17 +127,13 @@ async fn publish(
     };
 
     // Read the first multipart field (the .nexa file)
-    let bundle_bytes = loop {
-        match multipart.next_field().await {
-            Ok(Some(field)) => {
-                match field.bytes().await {
-                    Ok(b) => break b.to_vec(),
-                    Err(e) => return err(StatusCode::BAD_REQUEST, &format!("read field: {e}")),
-                }
-            }
-            Ok(None) => return err(StatusCode::BAD_REQUEST, "no file in multipart"),
-            Err(e) => return err(StatusCode::BAD_REQUEST, &format!("multipart error: {e}")),
-        }
+    let bundle_bytes = match multipart.next_field().await {
+        Ok(Some(field)) => match field.bytes().await {
+            Ok(b) => b.to_vec(),
+            Err(e) => return err(StatusCode::BAD_REQUEST, &format!("read field: {e}")),
+        },
+        Ok(None) => return err(StatusCode::BAD_REQUEST, "no file in multipart"),
+        Err(e) => return err(StatusCode::BAD_REQUEST, &format!("multipart error: {e}")),
     };
 
     match state.packages.publish(&name, user_id, bundle_bytes).await {

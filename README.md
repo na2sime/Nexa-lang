@@ -40,6 +40,7 @@ app App {
 - **Integrated dev server** — `nexa run` compiles and serves with live reload
 - **Watch mode** — `nexa run --watch` recompiles and reloads the browser on every save
 - **`.nexa` bundle** — `nexa package` produces a distributable binary bundle (ZIP + AST + signature)
+- **Package manager** — `nexa publish / install` + a self-hosted registry with JWT auth and PostgreSQL
 - **Project structure** — standardized layout enforced by the CLI
 
 ---
@@ -92,13 +93,15 @@ my-app/
   "version": "0.1.0",
   "author": "Your Name",
   "main": "app.nx",
-  "dependencies": []
+  "dependencies": {}
 }
 ```
 
 **`nexa-compiler.yaml`**
 ```yaml
 version: "0.1"
+# Optional: override the default public registry
+# registry: "https://registry.nexa-lang.org"
 ```
 
 **`src/main/app.nx`**
@@ -298,11 +301,108 @@ nexa build   [--project <dir>]
 
 nexa package [--project <dir>] [--output <file>]
     Package the project into a distributable .nexa bundle
+
+nexa register [--registry <url>]
+    Create an account on a registry (prompts for email + password)
+
+nexa login   [--registry <url>]
+    Log in to a registry and save credentials to ~/.nexa/credentials.json
+
+nexa publish [--project <dir>] [--registry <url>]
+    Build a .nexa bundle and publish it to the registry
+
+nexa install [<package[@version]>] [--project <dir>]
+    Install a package from the registry into nexa-libs/
+    Omit <package> to install all dependencies from project.json
 ```
 
 `--project` defaults to the current directory.  
+`--registry` defaults to the URL stored in `~/.nexa/credentials.json`, then to `https://registry.nexa-lang.org`.  
 `--watch` enables hot-module reload via WebSocket.  
 `--output` defaults to `<project-name>.nexa` in the current directory.
+
+---
+
+## Package Manager
+
+Nexa comes with a built-in package manager backed by a self-hosted registry.
+
+### Declaring dependencies
+
+In `project.json`, `dependencies` is a map of package name → semver constraint:
+
+```json
+{
+  "name": "my-app",
+  "version": "0.1.0",
+  "dependencies": {
+    "ui-kit": "^1.0.0",
+    "auth-utils": "2.3.1"
+  }
+}
+```
+
+### Workflow
+
+```bash
+# 1. Create an account
+nexa register
+
+# 2. Log in (saves JWT to ~/.nexa/credentials.json)
+nexa login
+
+# 3. Publish your library
+nexa publish --project path/to/my-lib
+
+# 4. Install a dependency
+nexa install ui-kit
+nexa install ui-kit@1.2.0   # pin a specific version
+
+# 5. Install all deps from project.json
+nexa install
+```
+
+Packages are extracted to `nexa-libs/<name>@<version>/` (gitignored). A JSON lockfile is written to `nexa-libs/.lock`.
+
+### Private registries
+
+Add private registries in `nexa-compiler.yaml`. They are tried before the public registry:
+
+```yaml
+version: "0.1"
+registry: "https://registry.nexa-lang.org"
+private_registries:
+  - url: "https://corp.registry.example.com"
+    key: "sk_live_abc123"
+```
+
+### Registry API
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/auth/register` | Create an account → `{ token }` |
+| `POST` | `/auth/login` | Log in → `{ token }` |
+| `POST` | `/packages/:name/publish` | Publish a `.nexa` bundle (Bearer auth) |
+| `GET`  | `/packages/:name` | Package info + version list |
+| `GET`  | `/packages/:name/:version/download` | Download the `.nexa` bundle |
+| `GET`  | `/packages?q=&page=&per_page=` | Search packages |
+
+### Running a registry
+
+The registry is a separate binary (`nexa-registry`) backed by PostgreSQL:
+
+```bash
+# Start the DB
+docker compose up -d registry-db
+
+# Start the registry
+DATABASE_URL=postgres://nexa:nexa@localhost:5432/nexa_registry \
+JWT_SECRET=change-me-in-prod \
+cargo run -p nexa-registry
+# → listening on port 4000
+```
+
+See `docker-compose.yml` at the workspace root for the full Docker Compose setup.
 
 ---
 
@@ -354,7 +454,7 @@ A hex-encoded SHA-256 hash of the concatenated `app.nxb` and `manifest.json` byt
 
 ## Architecture
 
-Nexa is a Rust workspace with three crates, each following Clean Architecture (domain / application / infrastructure / interfaces):
+Nexa is a Rust workspace with four crates, each following Clean Architecture (domain / application / infrastructure / interfaces):
 
 ```
 crates/
@@ -367,12 +467,21 @@ crates/
 │   └── infrastructure/  FsSourceProvider (prod), MemSourceProvider (tests)
 │
 ├── cli/
-│   ├── application/     NexaProject config loading, build/run/package commands
+│   ├── application/     project.json / nexa-compiler.yaml config, credentials,
+│   │                    run/build/package/login/register/publish/install commands
 │   └── interfaces/      Clap CLI definition (Cli, Commands)
 │
-└── server/
-    ├── application/     AppState, SharedState, HMR broadcast
-    └── interfaces/      Axum routes (/, /app.js, /ws WebSocket)
+├── server/
+│   ├── application/     AppState, SharedState, HMR broadcast
+│   └── interfaces/      Axum routes (/, /app.js, /ws WebSocket)
+│
+└── registry/
+    ├── domain/          User, Package, PackageVersion entities
+    ├── application/
+    │   ├── ports/       UserStore + PackageStore traits
+    │   └── services/    AuthService (JWT/bcrypt), PackagesService
+    ├── infrastructure/  PgUserStore, PgPackageStore (sqlx)
+    └── interfaces/      Axum HTTP API (auth, publish, download, search)
 ```
 
 **Compilation pipeline:**
@@ -420,7 +529,10 @@ Contributions are welcome! Please read [CONTRIBUTING.md](CONTRIBUTING.md) first.
 - [x] Clean Architecture (domain / application / infrastructure / interfaces)
 - [x] `.nexa` bundle format (NXB bytecode + manifest + SHA-256 signature)
 - [x] Optimizer pipeline (dead code removal, inlining, flattening, constant folding)
-- [ ] Dependency resolution via `dependencies` in `project.json`
+- [x] Package manager (`nexa publish / install`) + self-hosted registry
+- [x] JWT auth + bcrypt password hashing for the registry
+- [x] Private registry support in `nexa-compiler.yaml`
+- [ ] Semver constraint resolution for `dependencies` in `project.json`
 - [ ] Unit test runner (`nexa test`)
 - [ ] Standard library (`std/`)
 - [ ] Language Server Protocol (LSP) support

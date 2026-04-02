@@ -10,7 +10,9 @@ path = "src/main.rs"
 [dependencies]
 axum          = { version = "0.7", features = ["multipart"] }
 tokio         = { version = "1",   features = ["full"] }
-sqlx          = { version = "0.7", features = ["runtime-tokio-native-tls", "postgres", "uuid", "chrono", "macros"] }
+sqlx          = { version = "0.7", features = ["runtime-tokio-native-tls", "postgres", "uuid", "chrono"] }
+sha2          = "0.10"
+zip           = "2.1"
 uuid          = { version = "1",   features = ["v4", "serde"] }
 chrono        = { version = "0.4", features = ["serde"] }
 jsonwebtoken  = "9"
