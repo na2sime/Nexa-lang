@@ -14,7 +14,9 @@ COPY crates/server/Cargo.toml    crates/server/Cargo.toml
 COPY crates/cli/Cargo.toml       crates/cli/Cargo.toml
 COPY crates/registry/Cargo.toml  crates/registry/Cargo.toml
 
-# Stub sources so cargo can resolve and compile all dependencies
+# Stub sources so cargo can resolve and compile all dependencies.
+# registry has BOTH lib.rs and main.rs — both must be stubbed or the
+# stub build fails and leaves corrupted artifacts that break the real build.
 RUN mkdir -p \
       crates/compiler/src \
       crates/server/src \
@@ -23,14 +25,16 @@ RUN mkdir -p \
  && echo 'pub fn main(){}' > crates/compiler/src/lib.rs \
  && echo 'pub fn main(){}' > crates/server/src/lib.rs \
  && echo 'fn main(){}' > crates/cli/src/main.rs \
+ && echo '' > crates/registry/src/lib.rs \
  && echo 'fn main(){}' > crates/registry/src/main.rs
 
-RUN cargo build --release -p nexa-registry 2>/dev/null; \
-    rm -rf crates/*/src
+RUN cargo build --release -p nexa-registry 2>/dev/null || true
+RUN rm -rf crates/*/src
 
-# Real build
+# Real build — touch ALL .rs files so Cargo does a full recompile of the
+# registry crate (incremental from a stub lib can cause linker confusion).
 COPY crates/ crates/
-RUN touch crates/registry/src/main.rs \
+RUN find crates/registry/src -name "*.rs" | xargs touch \
  && cargo build --release -p nexa-registry
 
 # ── Stage 2 : runtime ─────────────────────────────────────────────────────────
