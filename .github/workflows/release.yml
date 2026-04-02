@@ -1,0 +1,188 @@
+name: Release (stable)
+
+# Triggered when a version tag is pushed: v1.2.3
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+
+permissions:
+  contents: write   # needed to create GitHub Releases and upload assets
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Build matrix — one job per target platform
+# ─────────────────────────────────────────────────────────────────────────────
+jobs:
+  build:
+    name: Build · ${{ matrix.asset }}
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ── Linux (static musl binaries — maximum portability) ──────────────
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            asset: nexa-linux-x86_64
+            use_cross: true
+
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            asset: nexa-linux-aarch64
+            use_cross: true
+
+          # ── macOS ───────────────────────────────────────────────────────────
+          - os: macos-13           # last Intel runner
+            target: x86_64-apple-darwin
+            asset: nexa-macos-x86_64
+            use_cross: false
+
+          - os: macos-latest       # Apple Silicon (M-series)
+            target: aarch64-apple-darwin
+            asset: nexa-macos-aarch64
+            use_cross: false
+
+          # ── Windows ─────────────────────────────────────────────────────────
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset: nexa-windows-x86_64
+            use_cross: false
+
+    steps:
+      # ── source ──────────────────────────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── toolchain ───────────────────────────────────────────────────────────
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # ── cargo cache ─────────────────────────────────────────────────────────
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: release-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: release-${{ matrix.target }}-
+
+      # ── cross (Linux only) ──────────────────────────────────────────────────
+      - name: Install cross
+        if: matrix.use_cross
+        run: cargo install cross --locked
+
+      # ── build ───────────────────────────────────────────────────────────────
+      - name: Build nexa (cross)
+        if: matrix.use_cross
+        run: cross build --release --locked --bin nexa --target ${{ matrix.target }}
+
+      - name: Build nexa (native)
+        if: "!matrix.use_cross"
+        run: cargo build --release --locked --bin nexa --target ${{ matrix.target }}
+
+      # ── package (Unix) ──────────────────────────────────────────────────────
+      - name: Create archive (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          BIN="target/${{ matrix.target }}/release/nexa"
+          ARCHIVE="${{ matrix.asset }}.tar.gz"
+
+          # Strip debug symbols to reduce size
+          strip "$BIN" 2>/dev/null || true
+
+          tar -czf "$ARCHIVE" -C "$(dirname "$BIN")" "$(basename "$BIN")"
+
+          # SHA-256 checksum — format: "<hash>  <filename>"
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$ARCHIVE" > "$ARCHIVE.sha256"
+          else
+            shasum -a 256 "$ARCHIVE" > "$ARCHIVE.sha256"
+          fi
+
+          echo "ASSET=$ARCHIVE"              >> "$GITHUB_ENV"
+          echo "CHECKSUM=$ARCHIVE.sha256"    >> "$GITHUB_ENV"
+
+      # ── package (Windows) ───────────────────────────────────────────────────
+      - name: Create archive (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $bin     = "target/${{ matrix.target }}/release/nexa.exe"
+          $archive = "${{ matrix.asset }}.zip"
+
+          Compress-Archive -Path $bin -DestinationPath $archive
+
+          $hash = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLower()
+          "$hash  $archive" | Set-Content "$archive.sha256"
+
+          "ASSET=$archive"           | Out-File -FilePath $env:GITHUB_ENV -Append
+          "CHECKSUM=$archive.sha256" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      # ── upload artifact for the release job ─────────────────────────────────
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: |
+            ${{ env.ASSET }}
+            ${{ env.CHECKSUM }}
+          retention-days: 1
+          if-no-files-found: error
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Release — collect all artifacts and publish the GitHub Release
+# ─────────────────────────────────────────────────────────────────────────────
+  release:
+    name: Publish stable release
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: List artifacts
+        run: find artifacts -type f | sort
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "Nexa ${{ github.ref_name }}"
+          tag_name: ${{ github.ref_name }}
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          make_latest: true
+          body: |
+            ## Installation
+
+            **One-line install (macOS / Linux):**
+            ```sh
+            curl --proto '=https' --tlsv1.2 -sSf \
+              https://raw.githubusercontent.com/na2sime/Nexa-lang/main/setup.sh | sh
+            ```
+
+            **Windows:** download `nexa-windows-x86_64.zip` below.
+
+            ---
+
+            See the [README](https://github.com/na2sime/Nexa-lang#readme) for full documentation.
+          files: artifacts/**/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

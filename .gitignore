@@ -8,3 +8,11 @@ dist/
 
 # macOS
 .DS_Store
+
+# Release artifacts produced locally
+*.tar.gz
+*.zip
+*.sha256
+nexa-linux-*
+nexa-macos-*
+nexa-windows-*

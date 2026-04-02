@@ -47,14 +47,43 @@ app App {
 
 ## Installation
 
-### Prerequisites
+### One-line install (macOS / Linux)
 
-- [Rust](https://rustup.rs/) 1.75 or later
+```sh
+curl --proto '=https' --tlsv1.2 -sSf \
+  https://raw.githubusercontent.com/na2sime/Nexa-lang/main/setup.sh | sh
+```
+
+The installer:
+- Downloads a prebuilt binary for your platform (x86_64 or aarch64)
+- Verifies the SHA-256 checksum before installing
+- Falls back to building from source if no binary is available (installs Rust via `rustup` automatically)
+- Adds `~/.nexa/bin` to your `PATH`
+
+**Windows:** download `nexa-windows-x86_64.zip` from [Releases](https://github.com/na2sime/Nexa-lang/releases/latest).
+
+### Release channels
+
+| Channel | Command | Description |
+|---------|---------|-------------|
+| `stable` | *(default)* | Latest tagged release — recommended |
+| `latest` | `--channel latest` | Alias for `stable` |
+| `snapshot` | `--channel snapshot` | Rolling build from `main` — unstable |
+
+```sh
+# Install the snapshot (dev) channel
+curl ... | sh -s -- --channel snapshot
+
+# Pin a specific version
+curl ... | sh -s -- --version v0.2.0
+```
 
 ### Build from source
 
+Requires [Rust](https://rustup.rs/) 1.75+:
+
 ```bash
-git clone https://github.com/nassime/Nexa-lang.git
+git clone https://github.com/na2sime/Nexa-lang.git
 cd Nexa-lang
 cargo install --path crates/cli
 ```

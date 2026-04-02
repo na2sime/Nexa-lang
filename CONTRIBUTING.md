@@ -205,6 +205,48 @@ refactor: extract run_pipeline in compiler lib
 
 ---
 
+## Release Process
+
+Nexa uses three release channels, all automated via GitHub Actions:
+
+| Channel | Trigger | Workflow |
+|---------|---------|----------|
+| **stable** | Push a `v*.*.*` tag | `.github/workflows/release.yml` |
+| **snapshot** | Push to `main` (Rust files) | `.github/workflows/snapshot.yml` |
+| **latest** | Alias for the most recent stable release | — |
+
+### Publishing a stable release
+
+```bash
+# 1. Bump the version in all relevant Cargo.toml files
+# 2. Commit and push the version bump
+git commit -am "chore: bump version to v0.2.0"
+
+# 3. Tag and push — this triggers the release workflow
+git tag v0.2.0
+git push origin v0.2.0
+```
+
+The workflow builds binaries for 5 targets, generates SHA-256 checksums, and publishes a GitHub Release with auto-generated release notes.
+
+### Snapshot releases
+
+Every push to `main` that touches Rust source automatically builds and updates the rolling `snapshot` pre-release at `https://github.com/na2sime/Nexa-lang/releases/tag/snapshot`.
+
+### Installer script
+
+`setup.sh` at the repository root handles all three channels. Test it locally:
+
+```bash
+# Dry-run syntax check
+sh -n setup.sh
+
+# Test a local install (with a prebuilt binary already in place)
+./setup.sh --channel stable --force
+```
+
+---
+
 ## Questions?
 
 Open a [GitHub Discussion](https://github.com/nassime/Nexa-lang/discussions) or a [GitHub Issue](https://github.com/nassime/Nexa-lang/issues).

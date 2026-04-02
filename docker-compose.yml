@@ -1,18 +1,16 @@
-version: "3.9"
-
 services:
   registry-db:
     image: postgres:16-alpine
     environment:
-      POSTGRES_DB:       nexa_registry
-      POSTGRES_USER:     nexa
+      POSTGRES_DB: nexa_registry
+      POSTGRES_USER: nexa
       POSTGRES_PASSWORD: nexa
     ports:
       - "5432:5432"
     volumes:
       - pg_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U nexa -d nexa_registry"]
+      test: [ "CMD-SHELL", "pg_isready -U nexa -d nexa_registry" ]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -23,8 +21,8 @@ services:
       dockerfile: crates/registry/Dockerfile
     environment:
       DATABASE_URL: postgres://nexa:nexa@registry-db:5432/nexa_registry
-      JWT_SECRET:   dev-secret-change-in-prod
-      PORT:         "4000"
+      JWT_SECRET: dev-secret-change-in-prod
+      PORT: "4000"
     ports:
       - "4000:4000"
     depends_on:

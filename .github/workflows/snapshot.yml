@@ -1,0 +1,191 @@
+name: Snapshot (dev)
+
+# Triggered on every push to main that touches Rust source or the CI itself.
+# Produces a rolling pre-release tagged "snapshot" — always points at HEAD.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/snapshot.yml'
+      - '.github/workflows/release.yml'
+
+  # Allow manual trigger from the Actions UI
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Build matrix — identical to release.yml
+# ─────────────────────────────────────────────────────────────────────────────
+jobs:
+  build:
+    name: Build · ${{ matrix.asset }}
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            asset: nexa-linux-x86_64
+            use_cross: true
+
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            asset: nexa-linux-aarch64
+            use_cross: true
+
+          - os: macos-13
+            target: x86_64-apple-darwin
+            asset: nexa-macos-x86_64
+            use_cross: false
+
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            asset: nexa-macos-aarch64
+            use_cross: false
+
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset: nexa-windows-x86_64
+            use_cross: false
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: snapshot-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: snapshot-${{ matrix.target }}-
+
+      - name: Install cross
+        if: matrix.use_cross
+        run: cargo install cross --locked
+
+      - name: Build nexa (cross)
+        if: matrix.use_cross
+        run: cross build --release --locked --bin nexa --target ${{ matrix.target }}
+
+      - name: Build nexa (native)
+        if: "!matrix.use_cross"
+        run: cargo build --release --locked --bin nexa --target ${{ matrix.target }}
+
+      - name: Create archive (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          BIN="target/${{ matrix.target }}/release/nexa"
+          ARCHIVE="${{ matrix.asset }}.tar.gz"
+          strip "$BIN" 2>/dev/null || true
+          tar -czf "$ARCHIVE" -C "$(dirname "$BIN")" "$(basename "$BIN")"
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$ARCHIVE" > "$ARCHIVE.sha256"
+          else
+            shasum -a 256 "$ARCHIVE" > "$ARCHIVE.sha256"
+          fi
+          echo "ASSET=$ARCHIVE"           >> "$GITHUB_ENV"
+          echo "CHECKSUM=$ARCHIVE.sha256" >> "$GITHUB_ENV"
+
+      - name: Create archive (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $bin     = "target/${{ matrix.target }}/release/nexa.exe"
+          $archive = "${{ matrix.asset }}.zip"
+          Compress-Archive -Path $bin -DestinationPath $archive
+          $hash = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLower()
+          "$hash  $archive" | Set-Content "$archive.sha256"
+          "ASSET=$archive"           | Out-File -FilePath $env:GITHUB_ENV -Append
+          "CHECKSUM=$archive.sha256" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: |
+            ${{ env.ASSET }}
+            ${{ env.CHECKSUM }}
+          retention-days: 1
+          if-no-files-found: error
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Rolling snapshot release — delete-and-recreate on every run
+# ─────────────────────────────────────────────────────────────────────────────
+  snapshot-release:
+    name: Publish snapshot release
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: List artifacts
+        run: find artifacts -type f | sort
+
+      # Move the "snapshot" git tag to the current commit so the release
+      # asset URLs (…/releases/download/snapshot/…) always serve fresh binaries.
+      - name: Update snapshot tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          SHORT_SHA=$(echo "${{ github.sha }}" | head -c 7)
+          BUILD_DATE=$(date -u '+%Y-%m-%d %H:%M UTC')
+
+          # Delete the existing release + tag if present (ignore errors)
+          gh release delete snapshot --yes --cleanup-tag 2>/dev/null || true
+          sleep 2
+
+          # Create a fresh snapshot pre-release
+          gh release create snapshot \
+            --title "Snapshot – ${BUILD_DATE} (${SHORT_SHA})" \
+            --notes "$(cat <<'NOTES'
+## ⚠️ Development Snapshot
+
+This is an **unstable pre-release** built automatically from the `main` branch.
+It may contain incomplete features or breaking changes.
+
+For production use, install the **stable** channel instead:
+
+```sh
+curl --proto '=https' --tlsv1.2 -sSf \
+  https://raw.githubusercontent.com/na2sime/Nexa-lang/main/setup.sh | sh
+```
+
+**Install snapshot:**
+```sh
+curl --proto '=https' --tlsv1.2 -sSf \
+  https://raw.githubusercontent.com/na2sime/Nexa-lang/main/setup.sh \
+  | sh -s -- --channel snapshot
+```
+NOTES
+)" \
+            --prerelease \
+            --target "${{ github.sha }}" \
+            artifacts/**/*
