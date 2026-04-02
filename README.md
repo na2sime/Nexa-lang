@@ -101,55 +101,27 @@ nexa --version
 ### 1. Create a project
 
 ```bash
-mkdir my-app && cd my-app
+nexa init my-app
+cd my-app
 ```
 
-Create the required structure:
+This scaffolds the full project structure and initialises a git repository:
 
 ```
 my-app/
-  project.json
-  nexa-compiler.yaml
-  src/
-    main/
-      app.nx
+├── project.json        ← metadata, dependencies
+├── nexa-compiler.yaml  ← compiler settings, registry config
+├── .gitignore
+└── src/
+    └── main/
+        └── app.nx      ← entry point
 ```
 
-**`project.json`**
-```json
-{
-  "name": "my-app",
-  "version": "0.1.0",
-  "author": "Your Name",
-  "main": "app.nx",
-  "dependencies": {}
-}
-```
+Pass `--author` to set the author name, or let the CLI read it from `git config`:
 
-**`nexa-compiler.yaml`**
-```yaml
-version: "0.1"
-# Optional: override the default public registry
-# registry: "https://registry.nexa-lang.org"
-```
-
-**`src/main/app.nx`**
-```nx
-package com.myapp;
-
-app App {
-  server { port: 3000; }
-
-  public window HomePage {
-    public render() => Component {
-      return Page {
-        Heading("Hello, Nexa!")
-      };
-    }
-  }
-
-  route "/" => HomePage;
-}
+```bash
+nexa init my-app --author "Alice" --version 0.2.0
+nexa init        # init in the current directory
 ```
 
 ### 2. Run the dev server
@@ -322,6 +294,9 @@ my-app/
 ## CLI Reference
 
 ```
+nexa init    [<name>] [--author <name>] [--version <ver>] [--no-git]
+    Scaffold a new Nexa project (creates directory, git repo, hello-world app)
+
 nexa run     [<bundle.nexa>] [--project <dir>] [--port <port>] [--watch]
     Compile + start dev server, or serve an existing .nexa bundle directly
 
@@ -552,7 +527,7 @@ Contributions are welcome! Please read [CONTRIBUTING.md](CONTRIBUTING.md) first.
 
 ## Roadmap
 
-- [ ] `nexa init` scaffold command
+- [x] `nexa init` scaffold command
 - [x] Watch mode (`nexa run --watch`) with HMR via WebSocket
 - [x] Error spans with rustc-style source locations
 - [x] Clean Architecture (domain / application / infrastructure / interfaces)

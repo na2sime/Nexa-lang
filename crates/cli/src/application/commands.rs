@@ -16,6 +16,210 @@ pub fn load_project(dir: Option<PathBuf>) -> NexaProject {
     })
 }
 
+// ── Init ──────────────────────────────────────────────────────────────────────
+
+pub fn init(name: Option<String>, author: Option<String>, version: String, no_git: bool) {
+    // ── resolve project name and target directory ─────────────────────────────
+    let project_name = name
+        .clone()
+        .unwrap_or_else(|| {
+            std::env::current_dir()
+                .ok()
+                .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+                .unwrap_or_else(|| "my-app".to_string())
+        });
+
+    // Validate name: only lowercase alphanumerics, hyphens, underscores
+    if !project_name.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_') {
+        eprintln!("error: project name '{}' must only contain letters, digits, hyphens or underscores", project_name);
+        std::process::exit(1);
+    }
+
+    let root = match name {
+        Some(_) => PathBuf::from(&project_name),
+        None    => PathBuf::from("."),
+    };
+
+    // ── guard: refuse to clobber an existing project ─────────────────────────
+    if root.join("project.json").exists() {
+        eprintln!("error: a Nexa project already exists in '{}'", root.display());
+        eprintln!("       Delete project.json first if you want to reinitialise.");
+        std::process::exit(1);
+    }
+
+    let author_str = author.unwrap_or_else(|| {
+        // Try git config first
+        std::process::Command::new("git")
+            .args(["config", "--get", "user.name"])
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "Unknown".to_string())
+    });
+
+    // ── create directory structure ────────────────────────────────────────────
+    let src_main = root.join("src").join("main");
+    fs::create_dir_all(&src_main).unwrap_or_else(|e| {
+        eprintln!("error: cannot create directory structure: {e}");
+        std::process::exit(1);
+    });
+
+    // ── project.json ─────────────────────────────────────────────────────────
+    let project_json = format!(
+        r#"{{
+  "name": "{name}",
+  "version": "{ver}",
+  "author": "{author}",
+  "main": "app.nx",
+  "dependencies": {{}}
+}}
+"#,
+        name   = project_name,
+        ver    = version,
+        author = author_str,
+    );
+    write_file(&root.join("project.json"), &project_json);
+
+    // ── nexa-compiler.yaml ────────────────────────────────────────────────────
+    let compiler_yaml = r#"version: "0.1"
+# registry: "https://registry.nexa-lang.org"
+# private_registries:
+#   - url: "https://corp.registry.example.com"
+#     key: "sk_live_..."
+"#;
+    write_file(&root.join("nexa-compiler.yaml"), compiler_yaml);
+
+    // ── src/main/app.nx  ─────────────────────────────────────────────────────
+    let app_class = to_pascal_case(&project_name);
+    let app_nx = format!(
+        r#"package {pkg};
+
+app {app} {{
+  server {{ port: 3000; }}
+
+  public window HomePage {{
+    public render() => Component {{
+      return Page {{
+        Heading("Welcome to {app}!")
+      }};
+    }}
+  }}
+
+  route "/" => HomePage;
+}}
+"#,
+        pkg = project_name.replace('-', "_"),
+        app = app_class,
+    );
+    write_file(&src_main.join("app.nx"), &app_nx);
+
+    // ── .gitignore ────────────────────────────────────────────────────────────
+    let gitignore = r#"# Rust build artifacts
+/target/
+
+# Nexa compiler output
+dist/
+**/src/dist/
+**/src/.nexa/
+
+# Installed packages
+nexa-libs/
+
+# Distributable bundles (built by nexa package)
+*.nexa
+
+# macOS
+.DS_Store
+
+# Environment variables
+.env
+"#;
+    write_file(&root.join(".gitignore"), gitignore);
+
+    // ── git init ──────────────────────────────────────────────────────────────
+    let git_initted = if !no_git {
+        let ok = std::process::Command::new("git")
+            .arg("init")
+            .arg(&root)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        ok
+    } else {
+        false
+    };
+
+    // ── success message ───────────────────────────────────────────────────────
+    println!();
+    println!("  \x1b[1;32m✓\x1b[0m  Created Nexa project \x1b[1m{}\x1b[0m", project_name);
+    println!();
+    println!("  \x1b[2m{}/\x1b[0m", root.display());
+    println!("  \x1b[2m├── project.json\x1b[0m");
+    println!("  \x1b[2m├── nexa-compiler.yaml\x1b[0m");
+    println!("  \x1b[2m├── .gitignore\x1b[0m");
+    println!("  \x1b[2m└── src/main/app.nx\x1b[0m");
+    if git_initted {
+        println!("  \x1b[2m   (git repository initialised)\x1b[0m");
+    }
+    println!();
+
+    let cd_hint = if root == Path::new(".") {
+        String::new()
+    } else {
+        format!("  cd {}\n", project_name)
+    };
+
+    println!("  Next steps:");
+    println!();
+    print!("{}", cd_hint);
+    println!("  \x1b[1mnexa run\x1b[0m          # start the dev server on http://localhost:3000");
+    println!("  \x1b[1mnexa run --watch\x1b[0m   # with hot reload");
+    println!("  \x1b[1mnexa build\x1b[0m         # compile to src/dist/");
+    println!();
+}
+
+fn write_file(path: &Path, content: &str) {
+    fs::write(path, content).unwrap_or_else(|e| {
+        eprintln!("error: cannot write {}: {e}", path.display());
+        std::process::exit(1);
+    });
+}
+
+/// "my-cool-app" → "MyCoolApp"
+fn to_pascal_case(s: &str) -> String {
+    s.split(['-', '_'])
+        .filter(|p| !p.is_empty())
+        .map(|p| {
+            let mut chars = p.chars();
+            match chars.next() {
+                None    => String::new(),
+                Some(f) => f.to_uppercase().collect::<String>() + chars.as_str(),
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod init_tests {
+    use super::to_pascal_case;
+
+    #[test]
+    fn pascal_case_conversion() {
+        assert_eq!(to_pascal_case("my-app"),        "MyApp");
+        assert_eq!(to_pascal_case("hello_world"),   "HelloWorld");
+        assert_eq!(to_pascal_case("my-cool-app"),   "MyCoolApp");
+        assert_eq!(to_pascal_case("app"),            "App");
+        assert_eq!(to_pascal_case("a-b-c"),          "ABC");
+        assert_eq!(to_pascal_case(""),               "");
+    }
+}
+
+// ── Build ─────────────────────────────────────────────────────────────────────
+
 pub fn build(project_dir: Option<PathBuf>) {
     updater::check_and_notify("stable");
     let proj = load_project(project_dir);

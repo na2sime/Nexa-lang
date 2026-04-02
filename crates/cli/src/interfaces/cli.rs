@@ -11,6 +11,21 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Crée un nouveau projet Nexa dans un nouveau répertoire
+    Init {
+        /// Nom du projet (et du répertoire à créer)
+        #[arg(value_name = "NAME")]
+        name: Option<String>,
+        /// Auteur du projet
+        #[arg(long, value_name = "AUTHOR")]
+        author: Option<String>,
+        /// Version initiale (défaut : 0.1.0)
+        #[arg(long, value_name = "VERSION", default_value = "0.1.0")]
+        version: String,
+        /// Ne pas initialiser un dépôt git
+        #[arg(long)]
+        no_git: bool,
+    },
     /// Compile le projet et démarre le dev server (accepte aussi un bundle .nexa)
     Run {
         /// Fichier .nexa à exécuter directement (optionnel)
@@ -82,6 +97,9 @@ enum Commands {
 pub async fn run() {
     let cli = Cli::parse();
     match cli.command {
+        Commands::Init { name, author, version, no_git } => {
+            commands::init(name, author, version, no_git)
+        }
         Commands::Run { bundle, project, port, watch } => {
             commands::run(bundle, project, port, watch).await
         }
