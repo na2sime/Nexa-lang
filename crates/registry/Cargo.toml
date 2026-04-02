@@ -1,0 +1,24 @@
+[package]
+name    = "nexa-registry"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "nexa-registry"
+path = "src/main.rs"
+
+[dependencies]
+axum          = { version = "0.7", features = ["multipart"] }
+tokio         = { version = "1",   features = ["full"] }
+sqlx          = { version = "0.7", features = ["runtime-tokio-native-tls", "postgres", "uuid", "chrono", "macros"] }
+uuid          = { version = "1",   features = ["v4", "serde"] }
+chrono        = { version = "0.4", features = ["serde"] }
+jsonwebtoken  = "9"
+bcrypt        = "0.15"
+serde         = { version = "1",   features = ["derive"] }
+serde_json    = "1"
+thiserror     = "1"
+tower-http    = { version = "0.5", features = ["cors"] }
+anyhow        = "1"
+dotenvy       = "0.15"
+async-trait   = "0.1"

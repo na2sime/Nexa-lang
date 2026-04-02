@@ -1,7 +1,7 @@
-Dead code removal
-Inline components
-Flatten tree
-Precompute props
+Dead code removal 	✅
+Inline components	✅
+Flatten tree	    ✅
+Precompute props    ✅
 
 package manager
 package registry
@@ -26,3 +26,6 @@ encryption
 frontend du package-registry officiel (fait en nexa)
 
 couche securiter/infra/docker/devops/k8s
+
+garbage collector
+gestion thread / async / coroutine 

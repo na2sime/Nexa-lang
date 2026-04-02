@@ -1,4 +1,4 @@
-use crate::application::project::NexaProject;
+use crate::application::{credentials, project::NexaProject};
 use nexa_compiler::{compile_project_file, compile_to_bundle, decode_nxb, CodeGenerator};
 use nexa_server::{AppState, build_router};
 use notify::{Config as WatchConfig, Event, RecommendedWatcher, RecursiveMode, Watcher};
@@ -239,6 +239,318 @@ async fn watch_task(state: Arc<AppState>, proj: NexaProject) {
         }
     }
 }
+
+// ── Registry commands ─────────────────────────────────────────────────────────
+
+const DEFAULT_REGISTRY: &str = "https://registry.nexa-lang.org";
+
+pub fn register(registry_override: Option<String>) {
+    let registry = registry_override.unwrap_or_else(|| DEFAULT_REGISTRY.to_string());
+    let (email, password) = prompt_credentials();
+    println!("Registering on {} ...", registry);
+    let url = format!("{registry}/auth/register");
+    match post_json(&url, &serde_json::json!({ "email": email, "password": password }), None) {
+        Ok(body) => {
+            if let Some(token) = body["token"].as_str() {
+                credentials::save(&registry, token);
+                println!("Account created. Logged in as {email}");
+            } else {
+                eprintln!("error: {}", body["error"].as_str().unwrap_or("unknown error"));
+                std::process::exit(1);
+            }
+        }
+        Err(e) => { eprintln!("error: {e}"); std::process::exit(1); }
+    }
+}
+
+pub fn login(registry_override: Option<String>) {
+    let registry = registry_override.unwrap_or_else(|| DEFAULT_REGISTRY.to_string());
+    let (email, password) = prompt_credentials();
+    println!("Logging in to {} ...", registry);
+    let url = format!("{registry}/auth/login");
+    match post_json(&url, &serde_json::json!({ "email": email, "password": password }), None) {
+        Ok(body) => {
+            if let Some(token) = body["token"].as_str() {
+                credentials::save(&registry, token);
+                println!("Logged in as {email}");
+            } else {
+                eprintln!("error: {}", body["error"].as_str().unwrap_or("invalid credentials"));
+                std::process::exit(1);
+            }
+        }
+        Err(e) => { eprintln!("error: {e}"); std::process::exit(1); }
+    }
+}
+
+pub fn publish(project_dir: Option<PathBuf>, registry_override: Option<String>) {
+    let proj = load_project(project_dir);
+    let app_name    = proj.project.name.clone();
+    let app_version = proj.project.version.clone();
+
+    let creds = credentials::load().unwrap_or_else(|| {
+        eprintln!("error: not logged in. Run `nexa login` first.");
+        std::process::exit(1);
+    });
+    let registry = registry_override.unwrap_or(creds.registry.clone());
+
+    println!("Packaging {} v{} ...", app_name, app_version);
+    let bundle = match compile_to_bundle(&proj.entry_file(), &proj.src_root(), &app_name, &app_version) {
+        Ok(b) => b,
+        Err(e) => { eprintln!("error: {e}"); std::process::exit(1); }
+    };
+
+    // Write bundle to a temp file
+    let tmp_path = std::env::temp_dir().join(format!("{app_name}-{app_version}.nexa"));
+    {
+        use std::io::Write as _;
+        let file = fs::File::create(&tmp_path).unwrap_or_else(|e| {
+            eprintln!("error: {e}"); std::process::exit(1);
+        });
+        let mut zip = zip::ZipWriter::new(file);
+        let opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        zip.start_file("app.nxb", opts).unwrap();
+        zip.write_all(&bundle.nxb).unwrap();
+        zip.start_file("manifest.json", opts).unwrap();
+        zip.write_all(bundle.manifest.as_bytes()).unwrap();
+        zip.start_file("signature.sig", opts).unwrap();
+        zip.write_all(bundle.signature.as_bytes()).unwrap();
+        zip.finish().unwrap();
+    }
+
+    println!("Publishing {app_name}@{app_version} to {registry} ...");
+    let url = format!("{registry}/packages/{app_name}/publish");
+    let file_bytes = fs::read(&tmp_path).unwrap_or_else(|e| {
+        eprintln!("error: {e}"); std::process::exit(1);
+    });
+    let _ = fs::remove_file(&tmp_path);
+
+    let client = reqwest::blocking::Client::new();
+    let part = reqwest::blocking::multipart::Part::bytes(file_bytes)
+        .file_name(format!("{app_name}.nexa"))
+        .mime_str("application/octet-stream")
+        .unwrap();
+    let form = reqwest::blocking::multipart::Form::new().part("file", part);
+
+    match client
+        .post(&url)
+        .bearer_auth(&creds.token)
+        .multipart(form)
+        .send()
+    {
+        Ok(resp) if resp.status().is_success() => {
+            println!("Published {app_name}@{app_version}");
+        }
+        Ok(resp) => {
+            let body: serde_json::Value = resp.json().unwrap_or_default();
+            eprintln!("error: {}", body["error"].as_str().unwrap_or("publish failed"));
+            std::process::exit(1);
+        }
+        Err(e) => { eprintln!("error: {e}"); std::process::exit(1); }
+    }
+}
+
+pub fn install(package_arg: Option<String>, project_dir: Option<PathBuf>) {
+    let proj = load_project(project_dir);
+    let registries = proj.compiler.all_registries();
+
+    let packages_to_install: Vec<(String, String)> = if let Some(arg) = package_arg {
+        // Parse "name" or "name@version"
+        if let Some((name, ver)) = arg.split_once('@') {
+            vec![(name.to_string(), ver.to_string())]
+        } else {
+            vec![(arg, "latest".to_string())]
+        }
+    } else {
+        // Install all deps from project.json
+        proj.project.dependencies
+            .iter()
+            .map(|(name, ver)| (name.clone(), ver.trim_start_matches('^').to_string()))
+            .collect()
+    };
+
+    if packages_to_install.is_empty() {
+        println!("No dependencies to install.");
+        return;
+    }
+
+    let libs_dir = proj.libs_dir();
+    fs::create_dir_all(&libs_dir).unwrap_or_else(|e| {
+        eprintln!("error: cannot create nexa-libs/: {e}"); std::process::exit(1);
+    });
+
+    let mut lock = load_lockfile(&libs_dir);
+
+    for (name, version) in &packages_to_install {
+        println!("Installing {name}@{version} ...");
+        let bundle = try_download(&registries, name, version);
+        let (registry_url, bundle_bytes) = bundle.unwrap_or_else(|| {
+            eprintln!("error: package {name}@{version} not found in any registry");
+            std::process::exit(1);
+        });
+
+        // Verify signature
+        verify_bundle_signature(&bundle_bytes, name);
+
+        // Extract to nexa-libs/<name>@<version>/
+        let pkg_dir = libs_dir.join(format!("{name}@{version}"));
+        extract_bundle_to(&bundle_bytes, &pkg_dir);
+
+        // Read actual version from manifest (in case "latest" was used)
+        let manifest_path = pkg_dir.join("manifest.json");
+        let resolved_version = fs::read_to_string(&manifest_path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .and_then(|v| v["version"].as_str().map(String::from))
+            .unwrap_or_else(|| version.clone());
+
+        let sig = fs::read_to_string(pkg_dir.join("signature.sig")).unwrap_or_default();
+        lock.packages.retain(|p: &LockEntry| p.name != *name);
+        lock.packages.push(LockEntry {
+            name: name.clone(),
+            version: resolved_version,
+            registry: registry_url,
+            signature: sig.trim().to_string(),
+        });
+
+        println!("  ✓ {name}");
+    }
+
+    save_lockfile(&libs_dir, &lock);
+    println!("Done. {} package(s) installed.", packages_to_install.len());
+}
+
+// ── Registry helpers ──────────────────────────────────────────────────────────
+
+fn prompt_credentials() -> (String, String) {
+    use std::io::{self, BufRead};
+    print!("Email: ");
+    std::io::Write::flush(&mut std::io::stdout()).unwrap();
+    let stdin = io::stdin();
+    let email = stdin.lock().lines().next()
+        .and_then(|l| l.ok())
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let password = rpassword::prompt_password("Password: ").unwrap_or_default();
+    (email, password)
+}
+
+fn post_json(url: &str, body: &serde_json::Value, token: Option<&str>) -> Result<serde_json::Value, String> {
+    let client = reqwest::blocking::Client::new();
+    let mut req = client.post(url).json(body);
+    if let Some(t) = token {
+        req = req.bearer_auth(t);
+    }
+    let resp = req.send().map_err(|e| e.to_string())?;
+    resp.json::<serde_json::Value>().map_err(|e| e.to_string())
+}
+
+fn try_download(registries: &[(String, Option<String>)], name: &str, version: &str) -> Option<(String, Vec<u8>)> {
+    let client = reqwest::blocking::Client::new();
+    for (url, key) in registries {
+        let endpoint = format!("{url}/packages/{name}/{version}/download");
+        let mut req = client.get(&endpoint);
+        if let Some(k) = key {
+            req = req.header("X-Api-Key", k);
+        }
+        if let Ok(resp) = req.send() {
+            if resp.status().is_success() {
+                if let Ok(bytes) = resp.bytes() {
+                    return Some((url.clone(), bytes.to_vec()));
+                }
+            }
+        }
+    }
+    None
+}
+
+fn verify_bundle_signature(bundle: &[u8], name: &str) {
+    use std::io::{Cursor, Read as _};
+    let cursor = Cursor::new(bundle);
+    let mut archive = zip::ZipArchive::new(cursor).unwrap_or_else(|e| {
+        eprintln!("error: invalid bundle for {name}: {e}"); std::process::exit(1);
+    });
+
+    let nxb = {
+        let mut e = archive.by_name("app.nxb").unwrap_or_else(|_| {
+            eprintln!("error: bundle missing app.nxb"); std::process::exit(1);
+        });
+        let mut buf = Vec::new(); e.read_to_end(&mut buf).unwrap(); buf
+    };
+    let manifest_str = {
+        let mut e = archive.by_name("manifest.json").unwrap_or_else(|_| {
+            eprintln!("error: bundle missing manifest.json"); std::process::exit(1);
+        });
+        let mut buf = String::new(); e.read_to_string(&mut buf).unwrap(); buf
+    };
+    let sig_str = {
+        let mut e = archive.by_name("signature.sig").unwrap_or_else(|_| {
+            eprintln!("error: bundle missing signature.sig"); std::process::exit(1);
+        });
+        let mut buf = String::new(); e.read_to_string(&mut buf).unwrap(); buf
+    };
+
+    let mut hasher = Sha256::new();
+    hasher.update(&nxb);
+    hasher.update(manifest_str.as_bytes());
+    let computed = format!("{:x}", hasher.finalize());
+    if computed != sig_str.trim() {
+        eprintln!("error: signature verification failed for {name} — bundle may be corrupted");
+        std::process::exit(1);
+    }
+}
+
+fn extract_bundle_to(bundle: &[u8], dest: &Path) {
+    use std::io::{Cursor, Read as _};
+    fs::create_dir_all(dest).unwrap_or_else(|e| {
+        eprintln!("error: cannot create {}: {e}", dest.display()); std::process::exit(1);
+    });
+    let cursor = Cursor::new(bundle);
+    let mut archive = zip::ZipArchive::new(cursor).unwrap();
+    for i in 0..archive.len() {
+        let mut entry = archive.by_index(i).unwrap();
+        let out_path = dest.join(entry.name());
+        let mut buf = Vec::new();
+        entry.read_to_end(&mut buf).unwrap();
+        fs::write(&out_path, &buf).unwrap_or_else(|e| {
+            eprintln!("error: write {}: {e}", out_path.display()); std::process::exit(1);
+        });
+    }
+}
+
+// ── Lockfile ──────────────────────────────────────────────────────────────────
+
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct Lockfile {
+    packages: Vec<LockEntry>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct LockEntry {
+    name: String,
+    version: String,
+    registry: String,
+    signature: String,
+}
+
+fn load_lockfile(libs_dir: &Path) -> Lockfile {
+    let path = libs_dir.join(".lock");
+    fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_lockfile(libs_dir: &Path, lock: &Lockfile) {
+    let path = libs_dir.join(".lock");
+    let json = serde_json::to_string_pretty(lock).expect("serialize lockfile");
+    fs::write(&path, json).unwrap_or_else(|e| {
+        eprintln!("warning: could not write lockfile: {e}");
+    });
+}
+
+// ── Build / Run / Package (unchanged) ─────────────────────────────────────────
 
 pub fn write_dist(dist_dir: &Path, result: nexa_compiler::CompileResult) {
     fs::create_dir_all(dist_dir).expect("cannot create dist/");

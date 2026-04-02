@@ -1,4 +1,5 @@
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -37,23 +38,53 @@ pub enum ProjectError {
 
 /// Désérialisé depuis `project.json`
 #[derive(Debug, Clone, Deserialize, PartialEq)]
-#[allow(dead_code)]
 pub struct ProjectConfig {
     pub name: String,
     pub version: String,
     pub author: String,
     /// Nom du fichier d'entrée dans `src/main/`, ex: "app.nx"
     pub main: String,
-    /// Réservé pour les futures dépendances
+    /// Dépendances : { "my-lib": "^1.0.0" }
     #[serde(default)]
-    pub dependencies: Vec<String>,
+    pub dependencies: HashMap<String, String>,
+}
+
+/// Un registry privé déclaré dans `nexa-compiler.yaml`
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct PrivateRegistry {
+    pub url: String,
+    pub key: String,
 }
 
 /// Désérialisé depuis `nexa-compiler.yaml`
 #[derive(Debug, Clone, Deserialize, PartialEq)]
-#[allow(dead_code)]
 pub struct CompilerConfig {
     pub version: String,
+    /// Registry public (défaut : https://registry.nexa-lang.org)
+    #[serde(default)]
+    pub registry: Option<String>,
+    /// Registries privés avec clé d'API
+    #[serde(default)]
+    pub private_registries: Vec<PrivateRegistry>,
+}
+
+impl CompilerConfig {
+    pub const DEFAULT_REGISTRY: &'static str = "https://registry.nexa-lang.org";
+
+    /// Returns all registries to try in order: private first, then public.
+    pub fn all_registries(&self) -> Vec<(String, Option<String>)> {
+        let mut out: Vec<(String, Option<String>)> = self
+            .private_registries
+            .iter()
+            .map(|r| (r.url.clone(), Some(r.key.clone())))
+            .collect();
+        let public = self
+            .registry
+            .clone()
+            .unwrap_or_else(|| Self::DEFAULT_REGISTRY.to_string());
+        out.push((public, None));
+        out
+    }
 }
 
 // ── Projet ────────────────────────────────────────────────────────────────────
@@ -62,7 +93,6 @@ pub struct CompilerConfig {
 pub struct NexaProject {
     root: PathBuf,
     pub project: ProjectConfig,
-    #[allow(dead_code)]
     pub compiler: CompilerConfig,
 }
 
@@ -137,6 +167,11 @@ impl NexaProject {
     pub fn dist_dir(&self) -> PathBuf {
         self.src_root().join("dist")
     }
+
+    /// `<root>/nexa-libs/`
+    pub fn libs_dir(&self) -> PathBuf {
+        self.root.join("nexa-libs")
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -177,9 +212,10 @@ mod tests {
 
     #[test]
     fn parse_project_config_with_dependencies() {
-        let json = r#"{"name":"a","version":"1","author":"b","main":"m.nx","dependencies":["lib1","lib2"]}"#;
+        let json = r#"{"name":"a","version":"1","author":"b","main":"m.nx","dependencies":{"my-lib":"^1.0.0","other":"2.0.0"}}"#;
         let cfg = parse_project_config(json).unwrap();
-        assert_eq!(cfg.dependencies, vec!["lib1", "lib2"]);
+        assert_eq!(cfg.dependencies.get("my-lib").map(String::as_str), Some("^1.0.0"));
+        assert_eq!(cfg.dependencies.get("other").map(String::as_str), Some("2.0.0"));
     }
 
     #[test]
@@ -197,6 +233,33 @@ mod tests {
     fn parse_compiler_config_valid() {
         let cfg = parse_compiler_config("version: \"0.1\"\n").unwrap();
         assert_eq!(cfg.version, "0.1");
+        assert!(cfg.registry.is_none());
+        assert!(cfg.private_registries.is_empty());
+    }
+
+    #[test]
+    fn parse_compiler_config_with_registry() {
+        let yaml = "version: \"0.1\"\nregistry: \"https://my.registry.com\"\n";
+        let cfg = parse_compiler_config(yaml).unwrap();
+        assert_eq!(cfg.registry.as_deref(), Some("https://my.registry.com"));
+    }
+
+    #[test]
+    fn parse_compiler_config_with_private_registries() {
+        let yaml = "version: \"0.1\"\nprivate_registries:\n  - url: \"https://corp.reg\"\n    key: \"sk_abc\"\n";
+        let cfg = parse_compiler_config(yaml).unwrap();
+        assert_eq!(cfg.private_registries.len(), 1);
+        assert_eq!(cfg.private_registries[0].url, "https://corp.reg");
+        assert_eq!(cfg.private_registries[0].key, "sk_abc");
+    }
+
+    #[test]
+    fn compiler_config_all_registries_order() {
+        let yaml = "version: \"0.1\"\nregistry: \"https://pub.reg\"\nprivate_registries:\n  - url: \"https://priv.reg\"\n    key: \"k\"\n";
+        let cfg = parse_compiler_config(yaml).unwrap();
+        let regs = cfg.all_registries();
+        assert_eq!(regs[0].0, "https://priv.reg"); // private first
+        assert_eq!(regs[1].0, "https://pub.reg");  // public second
     }
 
     #[test]
@@ -217,6 +280,7 @@ mod tests {
         assert_eq!(proj.src_root(),   tmp.path().join("src"));
         assert_eq!(proj.entry_file(), tmp.path().join("src").join("main").join("app.nx"));
         assert_eq!(proj.dist_dir(),   tmp.path().join("src").join("dist"));
+        assert_eq!(proj.libs_dir(),   tmp.path().join("nexa-libs"));
     }
 
     #[test]

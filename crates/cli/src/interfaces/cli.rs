@@ -41,6 +41,36 @@ enum Commands {
         #[arg(short, long, value_name = "FILE")]
         output: Option<PathBuf>,
     },
+    /// Crée un compte sur le registry
+    Register {
+        /// URL du registry (défaut : https://registry.nexa-lang.org)
+        #[arg(long, value_name = "URL")]
+        registry: Option<String>,
+    },
+    /// Connexion au registry
+    Login {
+        /// URL du registry (défaut : https://registry.nexa-lang.org)
+        #[arg(long, value_name = "URL")]
+        registry: Option<String>,
+    },
+    /// Publie le projet sur le registry
+    Publish {
+        /// Répertoire racine du projet (défaut : répertoire courant)
+        #[arg(short, long, value_name = "DIR")]
+        project: Option<PathBuf>,
+        /// URL du registry (défaut : credentials ou https://registry.nexa-lang.org)
+        #[arg(long, value_name = "URL")]
+        registry: Option<String>,
+    },
+    /// Installe des dépendances depuis le registry
+    Install {
+        /// Package à installer, ex: my-lib ou my-lib@1.0.0 (défaut : toutes les deps de project.json)
+        #[arg(value_name = "PACKAGE")]
+        package: Option<String>,
+        /// Répertoire racine du projet (défaut : répertoire courant)
+        #[arg(short, long, value_name = "DIR")]
+        project: Option<PathBuf>,
+    },
 }
 
 pub async fn run() {
@@ -51,5 +81,9 @@ pub async fn run() {
         }
         Commands::Build { project }             => commands::build(project),
         Commands::Package { project, output }   => commands::package(project, output),
+        Commands::Register { registry }         => commands::register(registry),
+        Commands::Login { registry }            => commands::login(registry),
+        Commands::Publish { project, registry } => commands::publish(project, registry),
+        Commands::Install { package, project }  => commands::install(package, project),
     }
 }
