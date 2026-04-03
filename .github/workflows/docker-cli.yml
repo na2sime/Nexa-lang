@@ -74,6 +74,9 @@ jobs:
 
       - name: Update Docker Hub description
         uses: peter-evans/dockerhub-description@v4
+        # Requires DOCKERHUB_TOKEN with "Read, Write & Delete" permissions.
+        # hub.docker.com → Account Settings → Personal Access Tokens
+        continue-on-error: true
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
