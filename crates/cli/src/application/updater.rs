@@ -59,6 +59,9 @@ const PLATFORM_ASSET: Option<&str> = None;
 #[derive(Debug, Deserialize)]
 struct GithubRelease {
     tag_name: String,
+    /// Release title, e.g. "Snapshot – 2026-04-03 10:00 UTC (abc1234)"
+    #[serde(default)]
+    name: String,
     assets: Vec<GithubAsset>,
 }
 
@@ -103,11 +106,46 @@ fn parse_version(v: &str) -> Option<(u32, u32, u32)> {
     Some((major, minor, patch))
 }
 
-/// Returns `true` if `candidate` is strictly newer than `current`.
+/// Returns `true` if `candidate` is strictly newer than `current` (semver).
 fn is_newer(candidate: &str, current: &str) -> bool {
     match (parse_version(candidate), parse_version(current)) {
         (Some(c), Some(cur)) => c > cur,
         _ => false,
+    }
+}
+
+/// Extract the short git SHA from a version string.
+/// "0.1.0-snapshot.abc1234" → Some("abc1234")
+/// "0.1.0-dev.abc1234"      → Some("abc1234")
+/// "0.1.0"                  → None  (stable install, no SHA)
+fn version_sha(v: &str) -> Option<&str> {
+    let suffix = v.split_once('-')?.1; // "snapshot.abc1234"
+    suffix.split_once('.').map(|(_, sha)| sha)
+}
+
+/// Extract the short git SHA from a snapshot release title.
+/// "Snapshot – 2026-04-03 10:00 UTC (abc1234)" → Some("abc1234")
+fn title_sha(title: &str) -> Option<&str> {
+    let start = title.rfind('(')? + 1;
+    let end = title.rfind(')')?;
+    if start < end {
+        Some(title[start..end].trim())
+    } else {
+        None
+    }
+}
+
+/// For snapshot channel: decide whether we should update.
+/// - If current binary has no SHA (was installed from stable), always update.
+/// - If SHAs differ, update.
+/// - If SHAs match, already up to date.
+fn snapshot_needs_update(release: &GithubRelease) -> bool {
+    match version_sha(CURRENT_VERSION) {
+        None => true, // stable binary → offer snapshot upgrade
+        Some(local_sha) => match title_sha(&release.name) {
+            None => true, // can't determine → offer update
+            Some(remote_sha) => local_sha != remote_sha,
+        },
     }
 }
 
@@ -190,7 +228,15 @@ pub fn check_for_update(channel: &str) -> Option<UpdateInfo> {
     let asset_name = PLATFORM_ASSET?;
     let release = fetch_release(channel).ok()?;
 
-    if !is_newer(&release.tag_name, CURRENT_VERSION) {
+    // Snapshot channel: compare git SHAs, not semver tags.
+    // The tag is always "snapshot" which is not a valid semver.
+    let needs_update = if channel == "snapshot" {
+        snapshot_needs_update(&release)
+    } else {
+        is_newer(&release.tag_name, CURRENT_VERSION)
+    };
+
+    if !needs_update {
         return None;
     }
 
@@ -198,8 +244,19 @@ pub fn check_for_update(channel: &str) -> Option<UpdateInfo> {
     let checksum_name = format!("{}.sha256", asset_name);
     let checksum_asset = release.assets.iter().find(|a| a.name == checksum_name)?;
 
+    // For snapshot, derive a human-readable version from the release title SHA.
+    let version = if channel == "snapshot" {
+        let base = parse_version(CURRENT_VERSION)
+            .map(|(ma, mi, pa)| format!("{ma}.{mi}.{pa}"))
+            .unwrap_or_else(|| "0.1.0".to_string());
+        let sha = title_sha(&release.name).unwrap_or("latest");
+        format!("{base}-snapshot.{sha}")
+    } else {
+        release.tag_name.trim_start_matches('v').to_string()
+    };
+
     Some(UpdateInfo {
-        version: release.tag_name.trim_start_matches('v').to_string(),
+        version,
         download_url: asset.browser_download_url.clone(),
         checksum_url: checksum_asset.browser_download_url.clone(),
     })
@@ -216,11 +273,18 @@ pub fn check_for_update(channel: &str) -> Option<UpdateInfo> {
 pub fn check_and_notify(channel: &str) {
     let cache = read_cache();
 
-    // Show notice if the cached latest is newer than what's installed
-    if !cache.latest_version.is_empty()
-        && cache.channel == channel
-        && is_newer(&cache.latest_version, CURRENT_VERSION)
-    {
+    // Show notice if the cached latest is newer than what's installed.
+    // For snapshot: compare SHAs (versions like "0.1.0-snapshot.abc1234").
+    let cached_is_newer = if channel == "snapshot" {
+        !cache.latest_version.is_empty()
+            && cache.channel == channel
+            && version_sha(&cache.latest_version) != version_sha(CURRENT_VERSION)
+    } else {
+        !cache.latest_version.is_empty()
+            && cache.channel == channel
+            && is_newer(&cache.latest_version, CURRENT_VERSION)
+    };
+    if cached_is_newer {
         eprintln!(
             "\n  \x1b[1;33m⬆  Nexa {} is available\x1b[0m (you have {}). \
              Run \x1b[1mnexa update\x1b[0m to upgrade.\n",
