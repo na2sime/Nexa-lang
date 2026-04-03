@@ -1,10 +1,10 @@
 # Official Nexa CLI Docker image
 # Usage:
-#   docker run --rm -v $(pwd):/app ghcr.io/nexa-lang-org/nexa build
-#   docker run --rm -p 3000:3000 -v $(pwd):/app ghcr.io/nexa-lang-org/nexa run
+#   docker run --rm -v $(pwd):/app nexalang/nexa build
+#   docker run --rm -p 3000:3000 -v $(pwd):/app nexalang/nexa run
 
 # ── Stage 1: Build ────────────────────────────────────────────────────────────
-FROM rust:slim AS builder
+FROM rust:1-slim-bookworm AS builder
 
 WORKDIR /build
 
@@ -41,7 +41,7 @@ RUN find crates/cli/src crates/compiler/src crates/server/src -name "*.rs" | xar
  && cargo build --release -p nexa
 
 # ── Stage 2: Runtime ──────────────────────────────────────────────────────────
-FROM debian:bookworm-slim
+FROM debian:12-slim
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
