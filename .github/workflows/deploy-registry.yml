@@ -78,6 +78,22 @@ jobs:
       - name: Checkout (for docker-compose.prod.yml + nginx conf)
         uses: actions/checkout@v4
 
+      - name: Verify SSH secrets are set
+        run: |
+          if [ -z "${{ secrets.VPS_HOST }}" ]; then
+            echo "::error::Secret VPS_HOST is not set. Go to Settings → Secrets → Actions."
+            exit 1
+          fi
+          if [ -z "${{ secrets.VPS_USER }}" ]; then
+            echo "::error::Secret VPS_USER is not set."
+            exit 1
+          fi
+          if [ -z "${{ secrets.VPS_SSH_KEY }}" ]; then
+            echo "::error::Secret VPS_SSH_KEY is not set."
+            exit 1
+          fi
+          echo "All SSH secrets present."
+
       - name: Copy compose + nginx config to VPS
         uses: appleboy/scp-action@v0.1.7
         with:
