@@ -1,7 +1,7 @@
 {
-  "name": "nexa-example-app",
+  "name": "examples",
   "version": "0.1.0",
-  "author": "Nexa Team",
-  "main": "app.nx",
-  "dependencies": []
+  "author": "Nassime Abdiou",
+  "modules": ["core"],
+  "dependencies": {}
 }
