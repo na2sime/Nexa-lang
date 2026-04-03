@@ -522,7 +522,10 @@ pub fn token_create(name: String, registry_override: Option<String>) {
                 "  \x1b[1;33mtoken:\x1b[0m  {}",
                 body["token"].as_str().unwrap_or("?")
             );
-            println!("  \x1b[2mid:    {}\x1b[0m", body["id"].as_str().unwrap_or("?"));
+            println!(
+                "  \x1b[2mid:    {}\x1b[0m",
+                body["id"].as_str().unwrap_or("?")
+            );
             ui::blank();
             ui::warn("Save this token now — it will not be shown again.");
             ui::blank();
@@ -606,9 +609,7 @@ pub fn token_revoke(id: String, registry_override: Option<String>) {
             let body: serde_json::Value = resp.json().unwrap_or_default();
             ui::fail(
                 &sp,
-                body["error"]
-                    .as_str()
-                    .unwrap_or(&format!("HTTP {status}")),
+                body["error"].as_str().unwrap_or(&format!("HTTP {status}")),
             );
         }
         Err(e) => ui::fail(&sp, e.to_string()),

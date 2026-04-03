@@ -332,14 +332,12 @@ impl TokenStore for PgTokenStore {
     }
 
     async fn delete(&self, id: Uuid, user_id: Uuid) -> Result<bool> {
-        let result = sqlx::query(
-            "DELETE FROM api_tokens WHERE id = $1 AND user_id = $2",
-        )
-        .bind(id)
-        .bind(user_id)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| anyhow!("delete token: {e}"))?;
+        let result = sqlx::query("DELETE FROM api_tokens WHERE id = $1 AND user_id = $2")
+            .bind(id)
+            .bind(user_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| anyhow!("delete token: {e}"))?;
         Ok(result.rows_affected() > 0)
     }
 }

@@ -73,11 +73,7 @@ impl AuthService {
 
     /// Generate a new permanent API token for `user_id`.
     /// Returns `(raw_token, ApiToken)` — the raw value is shown only once.
-    pub async fn create_api_token(
-        &self,
-        user_id: Uuid,
-        name: &str,
-    ) -> Result<(String, ApiToken)> {
+    pub async fn create_api_token(&self, user_id: Uuid, name: &str) -> Result<(String, ApiToken)> {
         let raw = generate_token();
         let hash = hash_token(&raw);
         let record = self.token_store.create(user_id, name, &hash).await?;
