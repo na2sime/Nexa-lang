@@ -309,6 +309,29 @@ function Paragraph(text) {
   el.textContent = String(text);
   return el;
 }
+
+// ── Logger ────────────────────────────────────────────────────────
+/** log(value, ...) — write to the browser console and an on-page log panel. */
+function log(...args) {
+  console.log(...args);
+  let panel = document.getElementById("_nx_log");
+  if (!panel) {
+    panel = document.createElement("div");
+    panel.id = "_nx_log";
+    panel.style.cssText = [
+      "position:fixed;bottom:0;left:0;right:0;max-height:200px;overflow-y:auto",
+      "background:#0d0d0d;color:#a8ff78;font:12px/1.5 monospace",
+      "padding:8px 12px;border-top:1px solid #333;z-index:9999",
+    ].join(";");
+    document.body.appendChild(panel);
+  }
+  const line = document.createElement("div");
+  line.textContent = args.map(a =>
+    typeof a === "object" ? JSON.stringify(a) : String(a)
+  ).join(" ");
+  panel.appendChild(line);
+  panel.scrollTop = panel.scrollHeight;
+}
 // ─────────────────────────────────────────────────────────────────────────────
 
 "#;

@@ -165,6 +165,11 @@ impl NexaProject {
         }
     }
 
+    /// Returns the project root directory.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     /// Returns `<root>/src/`.
     pub fn src_root(&self) -> PathBuf {
         self.root.join("src")

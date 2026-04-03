@@ -320,6 +320,11 @@ pub fn package(project_dir: Option<PathBuf>, output: Option<PathBuf>) {
         .expect("zip: signature.sig");
     zip.write_all(bundle.signature.as_bytes())
         .expect("zip: write sig");
+    // Include entry source so the registry and CLI can display it
+    let src_entry = format!("src/{}", bundle.source_filename);
+    zip.start_file(&src_entry, opts).expect("zip: src");
+    zip.write_all(bundle.source.as_bytes())
+        .expect("zip: write src");
     zip.finish().expect("zip: finish");
 
     ui::done(&sp, format!("Package OK  →  {}", out_path.display()));
@@ -529,6 +534,9 @@ pub fn publish(project_dir: Option<PathBuf>, registry_override: Option<String>) 
         zip.write_all(bundle.manifest.as_bytes()).unwrap();
         zip.start_file("signature.sig", opts).unwrap();
         zip.write_all(bundle.signature.as_bytes()).unwrap();
+        let src_entry = format!("src/{}", bundle.source_filename);
+        zip.start_file(&src_entry, opts).unwrap();
+        zip.write_all(bundle.source.as_bytes()).unwrap();
         zip.finish().unwrap();
     }
 
@@ -628,6 +636,10 @@ pub fn install(package_arg: Option<String>, project_dir: Option<PathBuf>) {
     }
 
     save_lockfile(&libs_dir, &lock);
+
+    // Update project.json dependencies with installed packages
+    update_project_dependencies(proj.root(), &packages_to_install, &lock);
+
     ui::blank();
     ui::success(format!(
         "{} package(s) installed.",
@@ -993,6 +1005,10 @@ fn extract_bundle_to(bundle: &[u8], dest: &Path) {
     for i in 0..archive.len() {
         let mut entry = archive.by_index(i).unwrap();
         let out_path = dest.join(entry.name());
+        // Create parent directories for entries like src/app.nx
+        if let Some(parent) = out_path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
         let mut buf = Vec::new();
         entry.read_to_end(&mut buf).unwrap();
         fs::write(&out_path, &buf)
@@ -1027,6 +1043,50 @@ fn save_lockfile(libs_dir: &Path, lock: &Lockfile) {
     fs::write(libs_dir.join(".lock"), json).unwrap_or_else(|e| {
         ui::warn(format!("could not write lockfile: {e}"));
     });
+}
+
+/// Write installed packages back into `project.json` dependencies.
+///
+/// Reads the existing `project.json`, merges the newly resolved versions into
+/// `"dependencies"`, then writes it back. Uses the version from the lockfile
+/// so that `"latest"` requests are pinned to the actual installed version.
+fn update_project_dependencies(
+    project_root: &Path,
+    installed: &[(String, String)],
+    lock: &Lockfile,
+) {
+    let path = project_root.join("project.json");
+    let text = match fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(_) => return,
+    };
+    let mut value: serde_json::Value = match serde_json::from_str(&text) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+
+    if let Some(obj) = value.as_object_mut() {
+        let deps = obj
+            .entry("dependencies")
+            .or_insert_with(|| serde_json::json!({}));
+        if let Some(deps_map) = deps.as_object_mut() {
+            for (name, _requested_ver) in installed {
+                // Pin to the version actually recorded in the lockfile
+                // ("latest" input → real resolved version like "1.0.0")
+                let pinned = lock
+                    .packages
+                    .iter()
+                    .find(|e| &e.name == name)
+                    .map(|e| e.version.as_str())
+                    .unwrap_or("latest");
+                deps_map.insert(name.clone(), serde_json::Value::String(pinned.to_string()));
+            }
+        }
+    }
+
+    if let Ok(updated) = serde_json::to_string_pretty(&value) {
+        let _ = fs::write(&path, updated);
+    }
 }
 
 // ── Build helper ──────────────────────────────────────────────────────────────

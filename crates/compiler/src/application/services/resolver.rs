@@ -126,6 +126,7 @@ impl<S: SourceProvider> Resolver<S> {
     /// 1. Relative to the importing file's directory: `User` → `./User.nx`
     /// 2. Relative root + all parts as dirs + last.nx
     /// 3. Project root / all parts as dirs / last.nx
+    /// 4. `<project>/nexa-libs/<pkg-name>@*/src/<Name>.nx` — installed packages
     fn resolve_path(
         &self,
         import_path: &str,
@@ -165,10 +166,32 @@ impl<S: SourceProvider> Resolver<S> {
             return Ok(self.source.canonicalize(&pkg_path).unwrap_or(pkg_path));
         }
 
+        // Try: <project>/nexa-libs/<pkg-name>@<ver>/src/<Name>.nx
+        // The resolver root is <project>/src/ — so libs are one level up.
+        if let Some(project_root) = self.root.parent() {
+            let libs_dir = project_root.join("nexa-libs");
+            // The first dotted segment is the package name; the last is the file name.
+            let pkg_name = parts[0];
+            let file_name = format!("{}.nx", parts.last().unwrap_or(&""));
+            if let Ok(entries) = std::fs::read_dir(&libs_dir) {
+                for entry in entries.flatten() {
+                    let dir_name = entry.file_name();
+                    let dir_str = dir_name.to_string_lossy();
+                    // Match directories like "my-lib@1.0.0" for import "my-lib.SomeClass"
+                    if dir_str.starts_with(pkg_name) {
+                        let candidate = entry.path().join("src").join(&file_name);
+                        if candidate.exists() {
+                            return Ok(candidate);
+                        }
+                    }
+                }
+            }
+        }
+
         Err(ResolveError::NotFound(
             import_path.to_string(),
             format!(
-                "tried: {}, {}, {}",
+                "tried: {}, {}, {} (and nexa-libs/)",
                 simple.display(),
                 rel_path.display(),
                 pkg_path.display()

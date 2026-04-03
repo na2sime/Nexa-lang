@@ -31,6 +31,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/packages/:name", get(get_package))
         .route("/packages/:name/publish", post(publish))
         .route("/packages/:name/:version/download", get(download))
+        .route("/packages/:name/:version/source", get(get_source))
+        .route("/ui/packages/:name", get(ui_package))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
@@ -241,4 +243,159 @@ async fn list_packages(State(state): State<AppState>, Query(q): Query<SearchQuer
         }
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
+}
+
+/// Extract the first `src/*.nx` file from a stored bundle (ZIP) and return its
+/// text content. Returns 404 if the version or source entry is not found.
+async fn get_source(
+    State(state): State<AppState>,
+    Path((name, version)): Path<(String, String)>,
+) -> Response {
+    let pv = match state.packages.download(&name, &version).await {
+        Ok(Some(pv)) => pv,
+        Ok(None) => return err(StatusCode::NOT_FOUND, "version not found"),
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
+    match extract_source_from_bundle(&pv.bundle) {
+        Some(src) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            src,
+        )
+            .into_response(),
+        None => err(StatusCode::NOT_FOUND, "no source included in this bundle"),
+    }
+}
+
+/// Simple HTML web page showing package info and source code.
+async fn ui_package(State(state): State<AppState>, Path(name): Path<String>) -> Response {
+    let pkg = match state.packages.get_package(&name).await {
+        Ok(Some(p)) => p,
+        Ok(None) => return err(StatusCode::NOT_FOUND, "package not found"),
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
+    let versions = match state.packages.list_versions(&name).await {
+        Ok(v) => v,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
+
+    // Fetch source of the latest version, if available
+    let latest_source: Option<String> = if let Some(latest) = versions.last() {
+        state
+            .packages
+            .download(&name, &latest.version)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|pv| extract_source_from_bundle(&pv.bundle))
+    } else {
+        None
+    };
+
+    let versions_html: String = versions
+        .iter()
+        .rev()
+        .map(|v| {
+            format!(
+                "<tr><td>{}</td><td>{}</td><td><a href=\"/packages/{}/{}/download\">\
+                 download</a> &nbsp; <a href=\"/packages/{}/{}/source\">source</a></td></tr>",
+                v.version,
+                v.published_at.format("%Y-%m-%d %H:%M UTC"),
+                pkg.name,
+                v.version,
+                pkg.name,
+                v.version,
+            )
+        })
+        .collect();
+
+    let source_section = match latest_source {
+        Some(src) => format!(
+            "<section class=\"src\"><h2>Source — latest version</h2>\
+             <pre><code>{}</code></pre></section>",
+            html_escape(&src)
+        ),
+        None => "<p class=\"dim\">No source available for this package.</p>".to_string(),
+    };
+
+    let html = format!(
+        r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>{name} — Nexa Registry</title>
+  <style>
+    *,*::before,*::after{{box-sizing:border-box;margin:0;padding:0}}
+    body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+          background:#0f0f13;color:#e2e2e8;padding:2rem 1.5rem;max-width:900px;margin:0 auto}}
+    h1{{font-size:2rem;margin-bottom:.25rem;color:#a78bfa}}
+    h2{{font-size:1.1rem;margin:1.5rem 0 .75rem;color:#94a3b8}}
+    a{{color:#7dd3fc;text-decoration:none}}a:hover{{text-decoration:underline}}
+    table{{border-collapse:collapse;width:100%;margin-bottom:1.5rem}}
+    th,td{{padding:.5rem 1rem;text-align:left;border-bottom:1px solid #1e1e2e}}
+    th{{color:#94a3b8;font-weight:600;font-size:.85rem}}
+    pre{{background:#1e1e2e;border-radius:8px;padding:1.25rem;overflow-x:auto;
+         font-size:.85rem;line-height:1.6;border:1px solid #2e2e3e}}
+    code{{color:#cdd6f4;white-space:pre}}
+    .dim{{color:#555;font-style:italic;margin-top:1rem}}
+    nav{{margin-bottom:2rem;color:#555}}
+    nav a{{color:#7dd3fc}}
+    .badge{{display:inline-block;background:#1e1e2e;border:1px solid #2e2e3e;
+            padding:.15rem .6rem;border-radius:99px;font-size:.8rem;color:#94a3b8}}
+    .install{{background:#1e1e2e;border:1px solid #2e2e3e;border-radius:8px;
+              padding:1rem 1.25rem;font-family:monospace;font-size:.9rem;
+              color:#a8ff78;margin:1rem 0 1.5rem}}
+  </style>
+</head>
+<body>
+  <nav><a href="/">Nexa Registry</a> / {name}</nav>
+  <h1>{name}</h1>
+  <p class="badge">{count} version(s)</p>
+  <div class="install">nexa install {name}</div>
+  <h2>Versions</h2>
+  <table>
+    <thead><tr><th>Version</th><th>Published</th><th>Links</th></tr></thead>
+    <tbody>{versions_html}</tbody>
+  </table>
+  {source_section}
+</body>
+</html>"#,
+        name = pkg.name,
+        count = versions.len(),
+    );
+
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        html,
+    )
+        .into_response()
+}
+
+// ── Bundle helpers ────────────────────────────────────────────────────────────
+
+/// Extract the source file (`src/*.nx`) from a raw `.nexa` bundle (ZIP bytes).
+fn extract_source_from_bundle(bundle: &[u8]) -> Option<String> {
+    use std::io::{Cursor, Read};
+    let cursor = Cursor::new(bundle);
+    let mut archive = zip::ZipArchive::new(cursor).ok()?;
+    for i in 0..archive.len() {
+        let mut entry = archive.by_index(i).ok()?;
+        let name = entry.name().to_string();
+        if name.starts_with("src/") && name.ends_with(".nx") {
+            let mut buf = String::new();
+            entry.read_to_string(&mut buf).ok()?;
+            return Some(buf);
+        }
+    }
+    None
+}
+
+/// Minimal HTML escaping to safely embed source code in a <pre> block.
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
 }

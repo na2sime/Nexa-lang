@@ -82,6 +82,10 @@ pub struct BundleResult {
     pub manifest: String,
     /// Hex-encoded SHA-256 of `nxb || manifest` bytes.
     pub signature: String,
+    /// Original `.nx` source of the entry file (used to include readable source in the bundle).
+    pub source: String,
+    /// Original file name of the entry file (e.g. `"app.nx"`).
+    pub source_filename: String,
 }
 
 /// Compile a project to a distributable `.nexa` bundle.
@@ -188,10 +192,17 @@ pub fn compile_to_bundle(
     hasher.update(manifest.as_bytes());
     let signature = format!("{:x}", hasher.finalize());
 
+    let source_filename = entry
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "main.nx".to_string());
+
     Ok(BundleResult {
         nxb,
         manifest,
         signature,
+        source,
+        source_filename,
     })
 }
 
