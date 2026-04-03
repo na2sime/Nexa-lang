@@ -1,7 +1,9 @@
-name: Snapshot (dev)
+name: Snapshot
 
-# Triggered on every push to main that touches Rust source or the CI itself.
-# Produces a rolling pre-release tagged "snapshot" — always points at HEAD.
+# ── Triggers ────────────────────────────────────────────────────────────────
+# • push to main   → full pipeline (CI + Docker snapshot + snapshot release)
+# • pull_request   → CI only (fmt / clippy / test)
+# • workflow_dispatch → full pipeline (manual)
 on:
   push:
     branches: [main]
@@ -9,60 +11,163 @@ on:
       - 'crates/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
+      - 'Dockerfile.cli'
+      - 'docker/**'
       - '.github/workflows/snapshot.yml'
-      - '.github/workflows/release.yml'
 
-  # Allow manual trigger from the Actions UI
+  pull_request:
+    branches: [main]
+
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: write   # create/update snapshot release
+  id-token: write   # SLSA provenance attestation
 
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  IMAGE_NAME: nexalang/nexa
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Build matrix — identical to release.yml
+# CI — runs on every trigger (PRs + main push)
 # ─────────────────────────────────────────────────────────────────────────────
 jobs:
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-clippy-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-clippy-
+      - run: cargo clippy --all -- -D warnings
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-test-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-test-
+      - run: cargo build --all
+      - run: cargo test --all
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Docker snapshot — main push + workflow_dispatch only
+# ─────────────────────────────────────────────────────────────────────────────
+  docker:
+    name: Docker · snapshot
+    needs: [fmt, clippy, test]
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=snapshot
+            type=sha,prefix=sha-,format=short
+          labels: |
+            org.opencontainers.image.title=Nexa CLI
+            org.opencontainers.image.description=Official CLI for the Nexa language — build, run, and publish Nexa projects
+            org.opencontainers.image.vendor=Nexa Language Organization
+            org.opencontainers.image.licenses=MIT
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile.cli
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: true
+          sbom: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Update Docker Hub description
+        uses: peter-evans/dockerhub-description@v4
+        continue-on-error: true
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          repository: ${{ env.IMAGE_NAME }}
+          readme-filepath: ./docker/hub-readme.md
+          short-description: Official CLI for the Nexa language — build, run, and publish Nexa projects
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Binary build — main push + workflow_dispatch only
+# ─────────────────────────────────────────────────────────────────────────────
   build:
     name: Build · ${{ matrix.asset }}
+    needs: [fmt, clippy, test]
+    if: github.event_name != 'pull_request'
     runs-on: ${{ matrix.os }}
 
     strategy:
       fail-fast: false
       matrix:
         include:
-          # Linux — native runners (no cross/Docker needed), static musl binaries
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
             asset: nexa-linux-x86_64
-
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
             asset: nexa-linux-aarch64
-
-          # macOS
           - os: macos-latest
             target: x86_64-apple-darwin
             asset: nexa-macos-x86_64
-
           - os: macos-latest
             target: aarch64-apple-darwin
             asset: nexa-macos-aarch64
-
-          # Windows
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             asset: nexa-windows-x86_64
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
@@ -70,8 +175,7 @@ jobs:
         if: contains(matrix.target, 'musl')
         run: sudo apt-get install -y musl-tools
 
-      - name: Cache cargo
-        uses: actions/cache@v4
+      - uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
@@ -80,7 +184,7 @@ jobs:
           key: snapshot-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: snapshot-${{ matrix.target }}-
 
-      - name: Build nexa
+      - name: Build
         shell: bash
         run: |
           SHORT_SHA="${GITHUB_SHA:0:7}"
@@ -88,7 +192,7 @@ jobs:
           export NEXA_RELEASE_VERSION="${PKG_VERSION}-snapshot.${SHORT_SHA}"
           cargo build --release --locked --bin nexa --target ${{ matrix.target }}
 
-      - name: Create archive (Unix)
+      - name: Archive (Unix)
         if: runner.os != 'Windows'
         shell: bash
         run: |
@@ -104,7 +208,7 @@ jobs:
           echo "ASSET=$ARCHIVE"           >> "$GITHUB_ENV"
           echo "CHECKSUM=$ARCHIVE.sha256" >> "$GITHUB_ENV"
 
-      - name: Create archive (Windows)
+      - name: Archive (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
@@ -116,8 +220,7 @@ jobs:
           "ASSET=$archive"           | Out-File -FilePath $env:GITHUB_ENV -Append
           "CHECKSUM=$archive.sha256" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset }}
           path: |
@@ -127,7 +230,7 @@ jobs:
           if-no-files-found: error
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Rolling snapshot release — delete-and-recreate on every run
+# Rolling snapshot release — main push + workflow_dispatch only
 # ─────────────────────────────────────────────────────────────────────────────
   snapshot-release:
     name: Publish snapshot release
@@ -135,19 +238,15 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Download all build artifacts
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
           path: artifacts
           merge-multiple: true
 
-      - name: List artifacts
-        run: find artifacts -type f | sort
+      - run: find artifacts -type f | sort
 
-      # Write release notes to a file — avoids heredoc inside YAML run block.
       - name: Write release notes
         run: |
           SHORT_SHA="${{ github.sha }}"
@@ -160,13 +259,10 @@ jobs:
           printf "  https://raw.githubusercontent.com/nexa-lang-org/nexa-lang/main/setup.sh \\\\\n" >> notes.md
           printf "  | sh -s -- --channel snapshot\n\`\`\`\n" >> notes.md
 
-      # Delete ONLY the rolling "snapshot" pre-release + its tag.
-      # Stable releases (v0.x.y tags) are never touched by this step.
       - name: Delete existing snapshot release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Safety guard: only delete if the release is a pre-release
           IS_PRE=$(gh release view snapshot --json isPrerelease -q '.isPrerelease' 2>/dev/null || echo "false")
           if [ "$IS_PRE" = "true" ]; then
             gh release delete snapshot --yes --cleanup-tag

@@ -1,6 +1,8 @@
 name: Deploy Registry
 
-# Triggered on every push to main that touches the registry crate or infra files.
+# ── Triggers ────────────────────────────────────────────────────────────────
+# • push to main (registry crate or infra files changed)
+# • workflow_dispatch (manual)
 on:
   push:
     branches: [main]
@@ -10,7 +12,6 @@ on:
       - 'nginx/**'
       - '.github/workflows/deploy-registry.yml'
 
-  # Allow manual trigger from the Actions UI
   workflow_dispatch:
 
 permissions:
@@ -18,35 +19,32 @@ permissions:
   packages: write   # push to ghcr.io
 
 env:
-  REGISTRY: ghcr.io
   IMAGE_NAME: ghcr.io/nexa-lang-org/nexa-registry
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Job 1 — Build & push the Docker image to ghcr.io
+# Job 1 — Build & push the registry image to ghcr.io
 # ─────────────────────────────────────────────────────────────────────────────
 jobs:
   build-and-push:
-    name: Build & push Docker image
+    name: Build & push registry image
     runs-on: ubuntu-latest
 
     outputs:
       image_tag: ${{ steps.meta.outputs.version }}
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v3
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
         with:
-          registry: ${{ env.REGISTRY }}
+          registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract Docker metadata (tags + labels)
+      - name: Extract Docker metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
@@ -75,21 +73,16 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout (for docker-compose.prod.yml + nginx conf)
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Verify SSH secrets are set
+      - name: Verify SSH secrets
         run: |
-          if [ -z "${{ secrets.VPS_HOST }}" ]; then
-            echo "::error::Secret VPS_HOST is not set. Go to Settings → Secrets → Actions."
-            exit 1
-          fi
-          if [ -z "${{ secrets.VPS_USER }}" ]; then
-            echo "::error::Secret VPS_USER is not set."
-            exit 1
-          fi
-          if [ -z "${{ secrets.VPS_SSH_KEY }}" ]; then
-            echo "::error::Secret VPS_SSH_KEY is not set."
+          missing=()
+          [ -z "${{ secrets.VPS_HOST }}"    ] && missing+=("VPS_HOST")
+          [ -z "${{ secrets.VPS_USER }}"    ] && missing+=("VPS_USER")
+          [ -z "${{ secrets.VPS_SSH_KEY }}" ] && missing+=("VPS_SSH_KEY")
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "::error::Missing secrets: ${missing[*]} — set them in Settings → Secrets → Actions"
             exit 1
           fi
           echo "All SSH secrets present."
@@ -103,7 +96,6 @@ jobs:
           port:     ${{ secrets.VPS_PORT || 22 }}
           source:   "docker-compose.prod.yml,nginx/"
           target:   "/opt/nexa-registry"
-          strip_components: 0
 
       - name: Pull new image and restart services
         uses: appleboy/ssh-action@v1.0.3
@@ -116,17 +108,11 @@ jobs:
             set -e
             cd /opt/nexa-registry
 
-            # Authenticate with ghcr.io using the deploy token
             echo "${{ secrets.GHCR_TOKEN }}" | \
               docker login ghcr.io -u nexa-lang-org --password-stdin
 
-            # Pull the freshly-built image
             docker compose -f docker-compose.prod.yml pull registry
-
-            # Zero-downtime rolling restart of the registry container only
             docker compose -f docker-compose.prod.yml up -d --no-deps registry
-
-            # Remove dangling images to free disk space
             docker image prune -f
 
             echo "Deploy complete — $(date -u '+%Y-%m-%d %H:%M UTC')"

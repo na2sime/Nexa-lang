@@ -1,59 +1,169 @@
-name: Release (stable)
+name: Release
 
-# Triggered when a version tag is pushed: v1.2.3
+# ── Trigger — manual only ───────────────────────────────────────────────────
 on:
-  push:
-    tags:
-      - 'v[0-9]+.[0-9]+.[0-9]+'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release (e.g. 0.2.0 — no "v" prefix)'
+        required: true
+        type: string
 
 permissions:
-  contents: write   # needed to create GitHub Releases and upload assets
+  contents: write   # create GitHub Release + tag
+  id-token: write   # SLSA provenance attestation
 
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  IMAGE_NAME: nexalang/nexa
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Build matrix — one job per target platform
+# CI — same checks as the snapshot pipeline
 # ─────────────────────────────────────────────────────────────────────────────
 jobs:
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-clippy-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-clippy-
+      - run: cargo clippy --all -- -D warnings
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-test-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-test-
+      - run: cargo build --all
+      - run: cargo test --all
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Docker — tags: latest, {version}, {major}.{minor}, sha-{short}
+# ─────────────────────────────────────────────────────────────────────────────
+  docker:
+    name: Docker · latest
+    needs: [fmt, clippy, test]
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Compute major.minor tag
+        id: ver
+        run: |
+          VERSION="${{ inputs.version }}"
+          echo "major_minor=${VERSION%.*}" >> "$GITHUB_OUTPUT"
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest
+            type=raw,value=${{ inputs.version }}
+            type=raw,value=${{ steps.ver.outputs.major_minor }}
+            type=sha,prefix=sha-,format=short
+          labels: |
+            org.opencontainers.image.title=Nexa CLI
+            org.opencontainers.image.description=Official CLI for the Nexa language — build, run, and publish Nexa projects
+            org.opencontainers.image.vendor=Nexa Language Organization
+            org.opencontainers.image.licenses=MIT
+            org.opencontainers.image.version=${{ inputs.version }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile.cli
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: true
+          sbom: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Update Docker Hub description
+        uses: peter-evans/dockerhub-description@v4
+        continue-on-error: true
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          repository: ${{ env.IMAGE_NAME }}
+          readme-filepath: ./docker/hub-readme.md
+          short-description: Official CLI for the Nexa language — build, run, and publish Nexa projects
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Binary build — all 5 target platforms
+# ─────────────────────────────────────────────────────────────────────────────
   build:
     name: Build · ${{ matrix.asset }}
+    needs: [fmt, clippy, test]
     runs-on: ${{ matrix.os }}
 
     strategy:
       fail-fast: false
       matrix:
         include:
-          # ── Linux (static musl binaries — native runners, no cross/Docker) ──
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
             asset: nexa-linux-x86_64
-
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
             asset: nexa-linux-aarch64
-
-          # ── macOS ───────────────────────────────────────────────────────────
           - os: macos-latest
             target: x86_64-apple-darwin
             asset: nexa-macos-x86_64
-
           - os: macos-latest
             target: aarch64-apple-darwin
             asset: nexa-macos-aarch64
-
-          # ── Windows ─────────────────────────────────────────────────────────
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             asset: nexa-windows-x86_64
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
@@ -61,8 +171,7 @@ jobs:
         if: contains(matrix.target, 'musl')
         run: sudo apt-get install -y musl-tools
 
-      - name: Cache cargo
-        uses: actions/cache@v4
+      - uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
@@ -71,89 +180,72 @@ jobs:
           key: release-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: release-${{ matrix.target }}-
 
-      - name: Build nexa
+      - name: Build
         shell: bash
         run: |
-          # Strip the leading "v" from the tag: v0.2.0 → 0.2.0
-          export NEXA_RELEASE_VERSION="${GITHUB_REF_NAME#v}"
+          export NEXA_RELEASE_VERSION="${{ inputs.version }}"
           cargo build --release --locked --bin nexa --target ${{ matrix.target }}
 
-      # ── package (Unix) ──────────────────────────────────────────────────────
-      - name: Create archive (Unix)
+      - name: Archive (Unix)
         if: runner.os != 'Windows'
         shell: bash
         run: |
           BIN="target/${{ matrix.target }}/release/nexa"
           ARCHIVE="${{ matrix.asset }}.tar.gz"
-
-          # Strip debug symbols to reduce size
           strip "$BIN" 2>/dev/null || true
-
           tar -czf "$ARCHIVE" -C "$(dirname "$BIN")" "$(basename "$BIN")"
-
-          # SHA-256 checksum — format: "<hash>  <filename>"
           if command -v sha256sum >/dev/null 2>&1; then
             sha256sum "$ARCHIVE" > "$ARCHIVE.sha256"
           else
             shasum -a 256 "$ARCHIVE" > "$ARCHIVE.sha256"
           fi
+          echo "ASSET=$ARCHIVE"           >> "$GITHUB_ENV"
+          echo "CHECKSUM=$ARCHIVE.sha256" >> "$GITHUB_ENV"
 
-          echo "ASSET=$ARCHIVE"              >> "$GITHUB_ENV"
-          echo "CHECKSUM=$ARCHIVE.sha256"    >> "$GITHUB_ENV"
-
-      # ── package (Windows) ───────────────────────────────────────────────────
-      - name: Create archive (Windows)
+      - name: Archive (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $bin     = "target/${{ matrix.target }}/release/nexa.exe"
           $archive = "${{ matrix.asset }}.zip"
-
           Compress-Archive -Path $bin -DestinationPath $archive
-
           $hash = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLower()
           "$hash  $archive" | Set-Content "$archive.sha256"
-
           "ASSET=$archive"           | Out-File -FilePath $env:GITHUB_ENV -Append
           "CHECKSUM=$archive.sha256" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      # ── upload artifact for the release job ─────────────────────────────────
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset }}
           path: |
             ${{ env.ASSET }}
             ${{ env.CHECKSUM }}
-          retention-days: 1
+          retention-days: 7
           if-no-files-found: error
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Release — collect all artifacts and publish the GitHub Release
+# GitHub Release — create tag + release + upload all binaries
 # ─────────────────────────────────────────────────────────────────────────────
   release:
     name: Publish stable release
-    needs: build
+    needs: [build, docker]
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Download all build artifacts
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
           path: artifacts
           merge-multiple: true
 
-      - name: List artifacts
-        run: find artifacts -type f | sort
+      - run: find artifacts -type f | sort
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          name: "Nexa ${{ github.ref_name }}"
-          tag_name: ${{ github.ref_name }}
+          name: "Nexa v${{ inputs.version }}"
+          tag_name: "v${{ inputs.version }}"
           draft: false
           prerelease: false
           generate_release_notes: true
