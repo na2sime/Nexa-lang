@@ -127,8 +127,8 @@ app {app} {{
     write_file(&core_src_main.join("app.nx"), &app_nx);
 
     let gitignore = r#"# Nexa compiler output
-modules/*/src/dist/
-modules/*/src/.nexa/
+dist/
+.nexa/
 
 # Installed packages (project-level and module-level)
 lib/

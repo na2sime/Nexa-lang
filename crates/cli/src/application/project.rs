@@ -306,9 +306,14 @@ impl NexaProject {
         self.module_dir(name).join("lib")
     }
 
-    /// Returns `<root>/modules/<name>/src/dist/` — build output for a module.
+    /// Returns `<root>/dist/<name>/` — build output for a module.
     pub fn dist_dir(&self, name: &str) -> PathBuf {
-        self.module_dir(name).join("src").join("dist")
+        self.root.join("dist").join(name)
+    }
+
+    /// Returns `<root>/.nexa/<name>/` — compiler cache for a module.
+    pub fn nexa_cache_dir(&self, name: &str) -> PathBuf {
+        self.root.join(".nexa").join(name)
     }
 
     // ── Main module shortcuts ─────────────────────────────────────────────────
@@ -480,14 +485,7 @@ mod tests {
                 .join("main")
                 .join("app.nx")
         );
-        assert_eq!(
-            proj.dist_dir("core"),
-            tmp.path()
-                .join("modules")
-                .join("core")
-                .join("src")
-                .join("dist")
-        );
+        assert_eq!(proj.dist_dir("core"), tmp.path().join("dist").join("core"));
         assert_eq!(proj.main_module_name(), "core");
         assert_eq!(proj.main_entry(), proj.module_entry("core"));
     }

@@ -1,6 +1,6 @@
 # Nexa compiler output
-modules/*/src/dist/
-modules/*/src/.nexa/
+dist/
+.nexa/
 
 # Installed packages (project-level and module-level)
 lib/
