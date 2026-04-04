@@ -4,7 +4,7 @@
 //! ```text
 //! let wat = WasmCodegen::new().generate_wat(&ir_module)?;
 //! std::fs::write("app.wat", &wat).unwrap();
-//! // Assemble with: wat2wasm app.wat -o app.wasm
+//! // Assemble with: wat2wasm --enable-bulk-memory app.wat -o app.wasm
 //! ```
 //!
 //! # Type mapping
@@ -17,11 +17,36 @@
 //! | `Void`           | —             | —            |
 //! | `Unknown`        | `i32`         | 4 bytes      |
 //!
-//! # Memory layout
+//! # Memory layout (generational semi-space GC)
 //! ```text
-//! [0 .. string_pool_end)  null-terminated string literals (data section)
-//! [heap_start .. ∞)       bump-allocated objects
+//! [0 .. string_pool_end)        → null-terminated string literals (data section)
+//! [heap_start .. page_1_start)  → unused padding (page-align nursery)
+//! [page_1 .. page_3)            → nursery FROM-space  (128 KiB)
+//! [page_3 .. page_5)            → nursery TO-space    (128 KiB)
+//! [page_5 .. page_13)           → old generation      (512 KiB)
+//! [page_13 .. page_14)          → shadow stack        (64 KiB)
+//! [page_14 .. page_15)          → remembered set      (64 KiB)
 //! ```
+//! Total: 15 pages × 64 KiB = 960 KiB.
+//!
+//! # Object header (every heap-allocated object)
+//! ```text
+//! [ptr + 0] : i32  — type tag (index into shape map, set by $gc_alloc)
+//! [ptr + 4] : i32  — forwarding pointer (0 = not moved; >0 = new address)
+//! [ptr + 8..]: user fields (struct layout starts at HEADER_SIZE)
+//! ```
+//!
+//! # GC algorithm
+//! Minor GC uses **Cheney's copying collector**:
+//!   1. Save `from_ptr` as the collection frontier.
+//!   2. Reset `to_ptr = to_start`.
+//!   3. Trace roots: shadow stack + remembered set.
+//!   4. Scan to-space [to_start, to_ptr) calling `$gc_scan_object` on each.
+//!   5. Swap from/to semi-spaces; reset `from_ptr = to_ptr`.
+//!
+//! Write barriers record old-gen → nursery pointers into the remembered set.
+//! Shadow stack (push/pop at method entry/exit) tracks live GC roots on the
+//! WASM call stack.
 //!
 //! # Required JS host imports
 //! ```javascript
@@ -101,6 +126,63 @@ fn ir_to_val(ty: &IrType) -> ValTy {
     }
 }
 
+// ── GC layout ─────────────────────────────────────────────────────────────────
+
+/// Size of the object header prepended to every heap-allocated object.
+///
+/// ```text
+/// [ptr + 0] : i32  — type tag
+/// [ptr + 4] : i32  — forwarding pointer (0 = not moved)
+/// [ptr + 8..]: user fields
+/// ```
+const HEADER_SIZE: u32 = 8;
+
+/// Memory regions for the generational semi-space GC.
+/// Offsets are bytes from the start of WASM linear memory.
+struct GcLayout {
+    nursery_from_start: u32,
+    nursery_from_end:   u32,
+    nursery_to_start:   u32,
+    nursery_to_end:     u32,
+    old_start:          u32,
+    old_end:            u32,
+    shadow_base:        u32,
+    rset_base:          u32,
+    total_pages:        u32,
+}
+
+impl GcLayout {
+    const PAGE:          u32 = 65_536; // 64 KiB
+    const NURSERY_PAGES: u32 = 2;      // 128 KiB per semi-space
+    const OLD_GEN_PAGES: u32 = 8;      // 512 KiB
+    const SHADOW_PAGES:  u32 = 1;      // 64 KiB
+    const RSET_PAGES:    u32 = 1;      // 64 KiB
+
+    fn new(heap_start: u32) -> Self {
+        // Page-align the nursery so it starts at a clean 64 KiB boundary.
+        let nursery_from_start = align_up(heap_start, Self::PAGE).max(Self::PAGE);
+        let nursery_from_end   = nursery_from_start + Self::NURSERY_PAGES * Self::PAGE;
+        let nursery_to_start   = nursery_from_end;
+        let nursery_to_end     = nursery_to_start   + Self::NURSERY_PAGES * Self::PAGE;
+        let old_start          = nursery_to_end;
+        let old_end            = old_start          + Self::OLD_GEN_PAGES * Self::PAGE;
+        let shadow_base        = old_end;
+        let rset_base          = shadow_base        + Self::SHADOW_PAGES  * Self::PAGE;
+        let total_pages        = (rset_base + Self::RSET_PAGES * Self::PAGE) / Self::PAGE;
+        GcLayout {
+            nursery_from_start,
+            nursery_from_end,
+            nursery_to_start,
+            nursery_to_end,
+            old_start,
+            old_end,
+            shadow_base,
+            rset_base,
+            total_pages,
+        }
+    }
+}
+
 // ── Struct layout ──────────────────────────────────────────────────────────────
 
 struct FieldSlot {
@@ -115,7 +197,8 @@ struct StructLayout {
 
 impl StructLayout {
     fn compute(cls: &IrClass) -> Self {
-        let mut offset = 0u32;
+        // Field offsets start AFTER the 8-byte GC header.
+        let mut offset = HEADER_SIZE;
         let mut slots = HashMap::new();
         for f in &cls.fields {
             let vt = ir_to_val(&f.ty);
@@ -123,7 +206,7 @@ impl StructLayout {
             slots.insert(f.name.clone(), FieldSlot { offset, vt });
             offset += vt.byte_size();
         }
-        StructLayout { slots, total_size: offset.max(4) }
+        StructLayout { slots, total_size: offset.max(HEADER_SIZE) }
     }
 
     fn get(&self, name: &str) -> Option<(u32, ValTy)> {
@@ -327,6 +410,13 @@ struct WatGen {
     loop_idx: usize,
     node_idx: usize,
     current_class: String,
+    /// Type tag assigned to each class (index in module.classes).
+    class_tags: HashMap<String, u32>,
+    /// Number of shadow-stack entries pushed by the current function.
+    /// Used to emit the correct number of pops before each `return`.
+    shadow_frame_depth: usize,
+    /// Return type of the current method (None = void).
+    current_return_vt: Option<ValTy>,
 }
 
 impl WatGen {
@@ -340,6 +430,9 @@ impl WatGen {
             loop_idx: 0,
             node_idx: 0,
             current_class: String::new(),
+            class_tags: HashMap::new(),
+            shadow_frame_depth: 0,
+            current_return_vt: None,
         }
     }
 
@@ -371,9 +464,10 @@ impl WatGen {
     // ── Top-level entry ───────────────────────────────────────────────────────
 
     fn compile(&mut self, module: &IrModule) -> Result<(), WasmCodegenError> {
-        // Phase 1 — collect strings and build layouts.
+        // Phase 1 — collect strings, build layouts, assign type tags.
         self.pool.intern("#app");
-        for cls in &module.classes {
+        for (idx, cls) in module.classes.iter().enumerate() {
+            self.class_tags.insert(cls.name.clone(), idx as u32);
             scan_strings_stmts(&cls.constructor_body, &mut self.pool);
             for m in &cls.methods {
                 scan_strings_stmts(&m.body, &mut self.pool);
@@ -385,16 +479,52 @@ impl WatGen {
         }
 
         let heap_start = self.pool.heap_start();
+        let gc = GcLayout::new(heap_start);
+
+        // Snapshot per-class shape data before mutable borrows below.
+        let shape_data: Vec<ClassShape> = module
+            .classes
+            .iter()
+            .enumerate()
+            .map(|(idx, cls)| {
+                let size = self
+                    .layouts
+                    .get(&cls.name)
+                    .map(|l| l.total_size)
+                    .unwrap_or(HEADER_SIZE);
+                let ptr_fields: Vec<(u32, String)> = self
+                    .layouts
+                    .get(&cls.name)
+                    .map(|layout| {
+                        let mut fields: Vec<(u32, String)> = layout
+                            .slots
+                            .iter()
+                            .filter(|(_, slot)| slot.vt == ValTy::I32)
+                            .map(|(name, slot)| (slot.offset, name.clone()))
+                            .collect();
+                        fields.sort_by_key(|(off, _)| *off);
+                        fields
+                    })
+                    .unwrap_or_default();
+                (idx as u32, cls.name.clone(), size, ptr_fields)
+            })
+            .collect();
 
         // Phase 2 — emit WAT.
-        self.out.push_str(";; Generated by nexa-compiler — WASM target\n");
-        self.out.push_str(";; Assemble: wat2wasm app.wat -o app.wasm\n");
+        self.out
+            .push_str(";; Generated by nexa-compiler — WASM target\n");
+        self.out.push_str(
+            ";; Assemble: wat2wasm --enable-bulk-memory app.wat -o app.wasm\n",
+        );
         self.ln("(module");
         self.indent += 1;
 
-        self.emit_memory(heap_start)?;
+        self.emit_memory(&gc)?;
         self.emit_imports();
-        self.emit_alloc(heap_start);
+        self.emit_gc_globals(&gc);
+        self.emit_gc_alloc();
+        self.emit_shape_map(&shape_data);
+        self.emit_gc_runtime(&gc);
 
         for cls in &module.classes {
             self.compile_class(cls)?;
@@ -409,9 +539,16 @@ impl WatGen {
 
     // ── Memory + data section ─────────────────────────────────────────────────
 
-    fn emit_memory(&mut self, heap_start: u32) -> Result<(), WasmCodegenError> {
-        self.section("Memory (2 pages = 128 KiB)");
-        self.ln("(memory (export \"memory\") 2)");
+    fn emit_memory(&mut self, gc: &GcLayout) -> Result<(), WasmCodegenError> {
+        self.section(&format!(
+            "Memory ({} pages = {} KiB — generational semi-space GC)",
+            gc.total_pages,
+            gc.total_pages * 64
+        ));
+        self.ln(&format!(
+            "(memory (export \"memory\") {})",
+            gc.total_pages
+        ));
 
         if !self.pool.data.is_empty() {
             self.blank();
@@ -427,7 +564,22 @@ impl WatGen {
         }
 
         self.blank();
-        self.comment(&format!("Heap starts at offset {}", heap_start));
+        self.comment(&format!(
+            "Nursery from [{}, {}) | to [{}, {})",
+            gc.nursery_from_start,
+            gc.nursery_from_end,
+            gc.nursery_to_start,
+            gc.nursery_to_end
+        ));
+        self.comment(&format!(
+            "Old gen [{}, {}) | shadow [{}, {}) | rset [{}, {})",
+            gc.old_start,
+            gc.old_end,
+            gc.shadow_base,
+            gc.shadow_base + GcLayout::SHADOW_PAGES * GcLayout::PAGE,
+            gc.rset_base,
+            gc.rset_base + GcLayout::RSET_PAGES * GcLayout::PAGE
+        ));
         Ok(())
     }
 
@@ -450,24 +602,438 @@ impl WatGen {
         }
     }
 
-    // ── Bump allocator ────────────────────────────────────────────────────────
+    // ── GC globals ────────────────────────────────────────────────────────────
 
-    fn emit_alloc(&mut self, heap_start: u32) {
-        self.section("Bump allocator");
+    fn emit_gc_globals(&mut self, gc: &GcLayout) {
+        self.section("GC globals — generational semi-space");
+        self.blank();
+        // Immutable region bounds
+        self.ln(&format!("(global $__gc_old_start i32 (i32.const {}))", gc.old_start));
+        self.ln(&format!("(global $__gc_old_end   i32 (i32.const {}))", gc.old_end));
         self.ln(&format!(
-            "(global $__heap_ptr (mut i32) (i32.const {}))",
-            heap_start
+            "(global $__gc_shadow_base i32 (i32.const {}))",
+            gc.shadow_base
+        ));
+        self.ln(&format!(
+            "(global $__gc_rset_base   i32 (i32.const {}))",
+            gc.rset_base
         ));
         self.blank();
-        self.ln("(func $__alloc (param $size i32) (result i32)");
+        // Mutable: current from-space (swapped with to-space on each minor GC)
+        self.ln(&format!(
+            "(global $__gc_from_start (mut i32) (i32.const {}))",
+            gc.nursery_from_start
+        ));
+        self.ln(&format!(
+            "(global $__gc_from_end   (mut i32) (i32.const {}))",
+            gc.nursery_from_end
+        ));
+        self.ln(&format!(
+            "(global $__gc_from_ptr   (mut i32) (i32.const {}))",
+            gc.nursery_from_start
+        ));
+        // Mutable: current to-space
+        self.ln(&format!(
+            "(global $__gc_to_start   (mut i32) (i32.const {}))",
+            gc.nursery_to_start
+        ));
+        self.ln(&format!(
+            "(global $__gc_to_end     (mut i32) (i32.const {}))",
+            gc.nursery_to_end
+        ));
+        self.ln(&format!(
+            "(global $__gc_to_ptr     (mut i32) (i32.const {}))",
+            gc.nursery_to_start
+        ));
+        // Old-gen bump pointer
+        self.ln(&format!(
+            "(global $__gc_old_ptr    (mut i32) (i32.const {}))",
+            gc.old_start
+        ));
+        // Shadow stack top
+        self.ln(&format!(
+            "(global $__gc_shadow_ptr (mut i32) (i32.const {}))",
+            gc.shadow_base
+        ));
+        // Remembered set top
+        self.ln(&format!(
+            "(global $__gc_rset_ptr   (mut i32) (i32.const {}))",
+            gc.rset_base
+        ));
+        // Saved from-ptr at start of minor GC (boundary for $gc_copy)
+        self.ln(&format!(
+            "(global $__gc_collect_frontier (mut i32) (i32.const {}))",
+            gc.nursery_from_start
+        ));
+        self.blank();
+        // Legacy globals kept for backward compatibility with tests and tooling.
+        self.comment("Legacy: bump-allocator globals (backed by GC from-space)");
+        self.ln(&format!(
+            "(global $__heap_ptr (mut i32) (i32.const {}))",
+            gc.nursery_from_start
+        ));
+    }
+
+    // ── GC allocator ─────────────────────────────────────────────────────────
+
+    fn emit_gc_alloc(&mut self) {
+        self.section("GC allocator");
+        self.blank();
+        self.comment(
+            "$gc_alloc — bump-allocate 'size' bytes tagged with 'tag'; \
+             triggers minor GC when nursery is full.",
+        );
+        self.ln("(func $gc_alloc (param $size i32) (param $tag i32) (result i32)");
         self.indent += 1;
         self.ln("(local $ptr i32)");
-        self.ln("(local.set $ptr (global.get $__heap_ptr))");
-        self.ln("(global.set $__heap_ptr");
+        self.comment("Trigger minor GC if nursery would overflow");
+        self.ln("(if (i32.gt_u");
         self.indent += 1;
-        self.ln("(i32.add (global.get $__heap_ptr) (local.get $size)))");
+        self.ln("(i32.add (global.get $__gc_from_ptr) (local.get $size))");
+        self.ln("(global.get $__gc_from_end))");
+        self.indent -= 1;
+        self.ln("(then (call $gc_minor_collect)))");
+        self.comment("Bump-allocate");
+        self.ln("(local.set $ptr (global.get $__gc_from_ptr))");
+        self.ln("(global.set $__gc_from_ptr");
+        self.indent += 1;
+        self.ln("(i32.add (global.get $__gc_from_ptr) (local.get $size)))");
+        self.indent -= 1;
+        self.comment("Write object header: tag at [+0], fwd=0 at [+4]");
+        self.ln("(i32.store (local.get $ptr) (local.get $tag))");
+        self.ln("(i32.store offset=4 (local.get $ptr) (i32.const 0))");
+        self.comment("Sync legacy heap pointer");
+        self.ln("(global.set $__heap_ptr (global.get $__gc_from_ptr))");
+        self.ln("(local.get $ptr))");
+        self.indent -= 1;
+        self.blank();
+        self.comment("$__alloc — legacy wrapper: calls $gc_alloc with tag=0.");
+        self.ln("(func $__alloc (param $size i32) (result i32)");
+        self.indent += 1;
+        self.ln("(call $gc_alloc (local.get $size) (i32.const 0)))");
+        self.indent -= 1;
+    }
+
+    // ── Shape map ────────────────────────────────────────────────────────────
+
+    /// Emit `$gc_object_size` and `$gc_scan_object` using pre-collected shape data.
+    ///
+    /// `shape_data`: `(tag, class_name, total_size, [(field_offset, field_name)])`
+    fn emit_shape_map(&mut self, shape_data: &[ClassShape]) {
+        self.section("Shape map — object size and pointer-field scanner");
+        self.blank();
+
+        // $gc_object_size: dispatch on tag → total object size (incl. header).
+        self.ln("(func $gc_object_size (param $tag i32) (result i32)");
+        self.indent += 1;
+        for (tag, cls_name, size, _) in shape_data {
+            self.ln(&format!(
+                "(if (i32.eq (local.get $tag) (i32.const {tag}))",
+            ));
+            self.indent += 1;
+            self.ln(&format!(
+                "(then (return (i32.const {size}))))  ;; class {cls_name}"
+            ));
+            self.indent -= 1;
+        }
+        self.ln(&format!(
+            "(i32.const {}))  ;; unknown tag — minimum header size",
+            HEADER_SIZE
+        ));
+        self.indent -= 1;
+        self.blank();
+
+        // $gc_scan_object: for each pointer field in the object, call $gc_copy
+        // and write back the (potentially new) address.
+        self.ln("(func $gc_scan_object (param $ptr i32)");
+        self.indent += 1;
+        self.ln("(local $tag i32)");
+        self.ln("(local.set $tag (i32.load (local.get $ptr)))");
+
+        for (tag, cls_name, _, ptr_fields) in shape_data {
+            if ptr_fields.is_empty() {
+                continue;
+            }
+            self.ln(&format!(
+                "(if (i32.eq (local.get $tag) (i32.const {tag}))",
+            ));
+            self.indent += 1;
+            self.ln("(then");
+            self.indent += 1;
+            for (offset, field_name) in ptr_fields {
+                self.comment(&format!(
+                    "class {cls_name} — field '{field_name}' at +{offset}"
+                ));
+                self.ln(&format!(
+                    "(i32.store offset={offset} (local.get $ptr)"
+                ));
+                self.indent += 1;
+                self.ln(&format!(
+                    "(call $gc_copy (i32.load offset={offset} (local.get $ptr)))))))",
+                ));
+                self.indent -= 1;
+            }
+            self.indent -= 1;
+            self.indent -= 1;
+        }
+        self.ln(")");
+        self.indent -= 1;
+    }
+
+    // ── GC runtime functions ──────────────────────────────────────────────────
+
+    fn emit_gc_runtime(&mut self, _gc: &GcLayout) {
+        self.section("GC runtime — Cheney copying collector");
+
+        // ── $gc_reload_if_forwarded ───────────────────────────────────────
+        self.blank();
+        self.comment(
+            "$gc_reload_if_forwarded — if the object was moved, return its new address.",
+        );
+        self.ln("(func $gc_reload_if_forwarded (param $ptr i32) (result i32)");
+        self.indent += 1;
+        self.ln("(local $fwd i32)");
+        self.comment("Null pointer — return as-is");
+        self.ln("(if (i32.eqz (local.get $ptr))");
+        self.indent += 1;
+        self.ln("(then (return (i32.const 0))))");
+        self.indent -= 1;
+        self.comment("Read forwarding pointer from header [+4]");
+        self.ln("(local.set $fwd (i32.load offset=4 (local.get $ptr)))");
+        self.ln("(if (local.get $fwd)");
+        self.indent += 1;
+        self.ln("(then (return (local.get $fwd))))");
         self.indent -= 1;
         self.ln("(local.get $ptr))");
+        self.indent -= 1;
+
+        // ── $gc_copy ─────────────────────────────────────────────────────
+        self.blank();
+        self.comment(
+            "$gc_copy — copy a nursery object to to-space (or old-gen if to-space is full). \
+             Returns the new address; sets forwarding pointer in the original.",
+        );
+        self.ln("(func $gc_copy (param $ptr i32) (result i32)");
+        self.indent += 1;
+        self.ln("(local $fwd i32)");
+        self.ln("(local $size i32)");
+        self.ln("(local $new_ptr i32)");
+        self.comment("Null pointer — return as-is");
+        self.ln("(if (i32.eqz (local.get $ptr))");
+        self.indent += 1;
+        self.ln("(then (return (i32.const 0))))");
+        self.indent -= 1;
+        self.comment("Not in from-space (e.g., old-gen, string pool) — return unchanged");
+        self.ln("(if (i32.or");
+        self.indent += 1;
+        self.ln("(i32.lt_u (local.get $ptr) (global.get $__gc_from_start))");
+        self.ln("(i32.ge_u (local.get $ptr) (global.get $__gc_collect_frontier)))");
+        self.indent -= 1;
+        self.ln("(then (return (local.get $ptr))))");
+        self.comment("Already forwarded? Return the forwarding pointer");
+        self.ln("(local.set $fwd (i32.load offset=4 (local.get $ptr)))");
+        self.ln("(if (local.get $fwd)");
+        self.indent += 1;
+        self.ln("(then (return (local.get $fwd))))");
+        self.indent -= 1;
+        self.comment("Get object size from shape map");
+        self.ln("(local.set $size (call $gc_object_size (i32.load (local.get $ptr))))");
+        self.comment("Try to-space first; fall back to old-gen if to-space is full");
+        self.ln("(if (i32.ge_u");
+        self.indent += 1;
+        self.ln("(i32.add (global.get $__gc_to_ptr) (local.get $size))");
+        self.ln("(global.get $__gc_to_end))");
+        self.indent -= 1;
+        self.ln("(then");
+        self.indent += 1;
+        self.comment("Promote to old-gen");
+        self.ln("(local.set $new_ptr (global.get $__gc_old_ptr))");
+        self.ln("(global.set $__gc_old_ptr");
+        self.indent += 1;
+        self.ln("(i32.add (global.get $__gc_old_ptr) (local.get $size))))");
+        self.indent -= 1;
+        self.indent -= 1;
+        self.ln("(else");
+        self.indent += 1;
+        self.comment("Copy to to-space");
+        self.ln("(local.set $new_ptr (global.get $__gc_to_ptr))");
+        self.ln("(global.set $__gc_to_ptr");
+        self.indent += 1;
+        self.ln("(i32.add (global.get $__gc_to_ptr) (local.get $size))))");
+        self.indent -= 1;
+        self.indent -= 1;
+        self.ln(")");
+        self.comment("Copy object bytes (requires --enable-bulk-memory / bulk-memory proposal)");
+        self.ln("(memory.copy (local.get $new_ptr) (local.get $ptr) (local.get $size))");
+        self.comment("Write forwarding pointer into original's header [+4]");
+        self.ln("(i32.store offset=4 (local.get $ptr) (local.get $new_ptr))");
+        self.comment("Clear fwd in the copy so it doesn't look forwarded");
+        self.ln("(i32.store offset=4 (local.get $new_ptr) (i32.const 0))");
+        self.ln("(local.get $new_ptr))");
+        self.indent -= 1;
+
+        // ── $gc_shadow_push / $gc_shadow_pop ─────────────────────────────
+        self.blank();
+        self.comment(
+            "$gc_shadow_push — push a GC root onto the shadow stack.",
+        );
+        self.ln("(func $gc_shadow_push (param $val i32)");
+        self.indent += 1;
+        self.ln("(i32.store (global.get $__gc_shadow_ptr) (local.get $val))");
+        self.ln("(global.set $__gc_shadow_ptr");
+        self.indent += 1;
+        self.ln("(i32.add (global.get $__gc_shadow_ptr) (i32.const 4))))");
+        self.indent -= 1;
+        self.indent -= 1;
+        self.blank();
+        self.comment(
+            "$gc_shadow_pop — pop a (potentially GC-updated) root off the shadow stack.",
+        );
+        self.ln("(func $gc_shadow_pop (result i32)");
+        self.indent += 1;
+        self.ln("(global.set $__gc_shadow_ptr");
+        self.indent += 1;
+        self.ln("(i32.sub (global.get $__gc_shadow_ptr) (i32.const 4)))");
+        self.indent -= 1;
+        self.ln("(i32.load (global.get $__gc_shadow_ptr)))");
+        self.indent -= 1;
+
+        // ── $gc_trace_shadow_stack ────────────────────────────────────────
+        self.blank();
+        self.comment(
+            "$gc_trace_shadow_stack — copy-update all live roots on the shadow stack.",
+        );
+        self.ln("(func $gc_trace_shadow_stack");
+        self.indent += 1;
+        self.ln("(local $scan i32)");
+        self.ln("(local.set $scan (global.get $__gc_shadow_base))");
+        self.ln("(block $done");
+        self.indent += 1;
+        self.ln("(loop $loop");
+        self.indent += 1;
+        self.ln("(br_if $done (i32.ge_u (local.get $scan) (global.get $__gc_shadow_ptr)))");
+        self.ln("(i32.store (local.get $scan)");
+        self.indent += 1;
+        self.ln("(call $gc_copy (i32.load (local.get $scan))))");
+        self.indent -= 1;
+        self.ln("(local.set $scan (i32.add (local.get $scan) (i32.const 4)))");
+        self.ln("(br $loop)))");
+        self.indent -= 1;
+        self.indent -= 1;
+        self.ln(")");
+        self.indent -= 1;
+
+        // ── $gc_trace_remembered_set ──────────────────────────────────────
+        self.blank();
+        self.comment(
+            "$gc_trace_remembered_set — re-scan old-gen objects that point into nursery.",
+        );
+        self.ln("(func $gc_trace_remembered_set");
+        self.indent += 1;
+        self.ln("(local $scan i32)");
+        self.ln("(local.set $scan (global.get $__gc_rset_base))");
+        self.ln("(block $done");
+        self.indent += 1;
+        self.ln("(loop $loop");
+        self.indent += 1;
+        self.ln("(br_if $done (i32.ge_u (local.get $scan) (global.get $__gc_rset_ptr)))");
+        self.ln("(call $gc_scan_object (i32.load (local.get $scan)))");
+        self.ln("(local.set $scan (i32.add (local.get $scan) (i32.const 4)))");
+        self.ln("(br $loop)))");
+        self.indent -= 1;
+        self.indent -= 1;
+        self.ln(")");
+        self.indent -= 1;
+
+        // ── $gc_write_barrier ─────────────────────────────────────────────
+        self.blank();
+        self.comment(
+            "$gc_write_barrier — record old-gen→nursery pointer stores in the remembered set.",
+        );
+        self.ln(
+            "(func $gc_write_barrier (param $obj_ptr i32) (param $new_val i32)",
+        );
+        self.indent += 1;
+        self.comment("If obj_ptr is in old-gen AND new_val is in nursery from-space → record");
+        self.ln("(if (i32.and");
+        self.indent += 1;
+        self.ln("(i32.and");
+        self.indent += 1;
+        self.ln("(i32.ge_u (local.get $obj_ptr) (global.get $__gc_old_start))");
+        self.ln("(i32.lt_u (local.get $obj_ptr) (global.get $__gc_old_end)))");
+        self.indent -= 1;
+        self.ln("(i32.and");
+        self.indent += 1;
+        self.ln("(i32.ge_u (local.get $new_val) (global.get $__gc_from_start))");
+        self.ln("(i32.lt_u (local.get $new_val) (global.get $__gc_from_ptr))))");
+        self.indent -= 1;
+        self.indent -= 1;
+        self.ln("(then");
+        self.indent += 1;
+        self.ln("(i32.store (global.get $__gc_rset_ptr) (local.get $obj_ptr))");
+        self.ln("(global.set $__gc_rset_ptr");
+        self.indent += 1;
+        self.ln("(i32.add (global.get $__gc_rset_ptr) (i32.const 4)))))");
+        self.indent -= 1;
+        self.indent -= 1;
+        self.ln(")");
+        self.indent -= 1;
+
+        // ── $gc_minor_collect ─────────────────────────────────────────────
+        self.blank();
+        self.comment(
+            "$gc_minor_collect — Cheney's copying minor GC: \
+             evacuates live nursery objects to to-space, then swaps semi-spaces.",
+        );
+        self.ln("(func $gc_minor_collect");
+        self.indent += 1;
+        self.ln("(local $scan i32)");
+        self.ln("(local $obj_size i32)");
+        self.ln("(local $old_from_start i32)");
+        self.ln("(local $old_from_end i32)");
+        self.blank();
+        self.comment("Save allocation frontier so $gc_copy knows what was live");
+        self.ln("(global.set $__gc_collect_frontier (global.get $__gc_from_ptr))");
+        self.comment("Reset to-space scanning/allocation pointer");
+        self.ln("(global.set $__gc_to_ptr (global.get $__gc_to_start))");
+        self.blank();
+        self.comment("1. Trace roots: shadow stack + remembered set");
+        self.ln("(call $gc_trace_shadow_stack)");
+        self.ln("(call $gc_trace_remembered_set)");
+        self.blank();
+        self.comment("2. Cheney scan: walk to-space, updating each object's pointer fields");
+        self.ln("(local.set $scan (global.get $__gc_to_start))");
+        self.ln("(block $scan_done");
+        self.indent += 1;
+        self.ln("(loop $scan_loop");
+        self.indent += 1;
+        self.ln("(br_if $scan_done (i32.ge_u (local.get $scan) (global.get $__gc_to_ptr)))");
+        self.ln("(call $gc_scan_object (local.get $scan))");
+        self.ln(
+            "(local.set $obj_size (call $gc_object_size (i32.load (local.get $scan))))",
+        );
+        self.ln("(local.set $scan (i32.add (local.get $scan) (local.get $obj_size)))");
+        self.ln("(br $scan_loop))");
+        self.indent -= 1;
+        self.indent -= 1;
+        self.ln(")");
+        self.blank();
+        self.comment("3. Swap from-space and to-space");
+        self.ln("(local.set $old_from_start (global.get $__gc_from_start))");
+        self.ln("(local.set $old_from_end   (global.get $__gc_from_end))");
+        self.comment("New from-space = old to-space (where survivors live)");
+        self.ln("(global.set $__gc_from_start (global.get $__gc_to_start))");
+        self.ln("(global.set $__gc_from_end   (global.get $__gc_to_end))");
+        self.ln("(global.set $__gc_from_ptr   (global.get $__gc_to_ptr))");
+        self.comment("New to-space = old from-space (now free for next collection)");
+        self.ln("(global.set $__gc_to_start   (local.get $old_from_start))");
+        self.ln("(global.set $__gc_to_end     (local.get $old_from_end))");
+        self.ln("(global.set $__gc_to_ptr     (local.get $old_from_start))");
+        self.comment("Sync legacy heap pointer");
+        self.ln("(global.set $__heap_ptr (global.get $__gc_from_ptr))");
+        self.blank();
+        self.comment("4. Clear remembered set");
+        self.ln("(global.set $__gc_rset_ptr (global.get $__gc_rset_base)))");
         self.indent -= 1;
     }
 
@@ -491,7 +1057,7 @@ impl WatGen {
             if !desc.is_empty() {
                 self.comment(&format!("struct {{ {} }}", desc.join(", ")));
             }
-            self.comment(&format!("total = {} bytes", total_size));
+            self.comment(&format!("total = {} bytes (incl. 8-byte GC header)", total_size));
         }
         self.blank();
 
@@ -506,7 +1072,13 @@ impl WatGen {
     }
 
     fn emit_constructor(&mut self, cls: &IrClass) -> Result<(), WasmCodegenError> {
-        let size = self.layouts.get(&cls.name).map(|l| l.total_size).unwrap_or(4);
+        let tag = self.class_tags.get(&cls.name).copied().unwrap_or(0);
+        let size = self
+            .layouts
+            .get(&cls.name)
+            .map(|l| l.total_size)
+            .unwrap_or(HEADER_SIZE);
+
         let params: String = cls
             .constructor_params
             .iter()
@@ -523,13 +1095,32 @@ impl WatGen {
         self.ln(&header);
         self.indent += 1;
         self.ln("(local $self i32)");
-        self.ln(&format!("(local.set $self (call $__alloc (i32.const {})))", size));
+        self.ln("(local $__wb_obj i32)");
+        self.ln("(local $__wb_val i32)");
 
-        // Store each param into its corresponding field.
+        self.comment(&format!(
+            "Allocate via GC: {} bytes, tag={}",
+            size, tag
+        ));
+        self.ln(&format!(
+            "(local.set $self (call $gc_alloc (i32.const {}) (i32.const {})))",
+            size, tag
+        ));
+        self.comment("Push self to shadow stack (GC will update this slot if object moves)");
+        self.ln("(call $gc_shadow_push (local.get $self))");
+
+        // Store each constructor param into its field.
         for p in &cls.constructor_params {
             let vt = ir_to_val(&p.ty);
             if let Some(layout) = self.layouts.get(&cls.name) {
                 if let Some((offset, _)) = layout.get(&p.name) {
+                    if vt == ValTy::I32 {
+                        // Write barrier: new object might store a pointer to nursery.
+                        self.ln(&format!(
+                            "(call $gc_write_barrier (local.get $self) (local.get ${}))",
+                            p.name
+                        ));
+                    }
                     self.ln(&format!(
                         "({} (local.get $self) (local.get ${}))",
                         vt.store(offset),
@@ -542,18 +1133,25 @@ impl WatGen {
         // Emit explicit constructor body if present.
         if !cls.constructor_body.is_empty() {
             self.current_class = cls.name.clone();
+            self.shadow_frame_depth = 1; // $self is on the shadow stack
             let mut let_locals: Vec<(String, ValTy)> = vec![("self".to_string(), ValTy::I32)];
             collect_let_locals(&cls.constructor_body, &mut let_locals);
             let local_map: HashMap<String, ValTy> = let_locals.into_iter().collect();
             self.emit_stmts(&cls.constructor_body.clone(), &local_map)?;
+            self.shadow_frame_depth = 0;
         }
 
-        self.ln("(local.get $self))");
+        self.comment("Pop shadow stack — returns the (possibly GC-updated) self address");
+        self.ln("(call $gc_shadow_pop))");
         self.indent -= 1;
         Ok(())
     }
 
-    fn emit_method(&mut self, class_name: &str, method: &IrMethod) -> Result<(), WasmCodegenError> {
+    fn emit_method(
+        &mut self,
+        class_name: &str,
+        method: &IrMethod,
+    ) -> Result<(), WasmCodegenError> {
         // Param signature: self (i32 pointer) + declared params.
         let mut param_parts = vec!["(param $self i32)".to_string()];
         param_parts.extend(method.params.iter().map(|p| {
@@ -570,12 +1168,23 @@ impl WatGen {
             "{}.{}(self{}) -> {}",
             class_name,
             method.name,
-            if method.params.is_empty() { String::new() } else {
-                format!(", {}", method.params.iter()
-                    .map(|p| format!("{}: {}", p.name, ir_to_val(&p.ty).as_str()))
-                    .collect::<Vec<_>>().join(", "))
+            if method.params.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    ", {}",
+                    method
+                        .params
+                        .iter()
+                        .map(|p| format!("{}: {}", p.name, ir_to_val(&p.ty).as_str()))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
             },
-            match &method.return_ty { IrType::Void => "void", ty => ir_to_val(ty).as_str() }
+            match &method.return_ty {
+                IrType::Void => "void",
+                ty => ir_to_val(ty).as_str(),
+            }
         ));
 
         self.ln(&format!(
@@ -584,7 +1193,7 @@ impl WatGen {
         ));
         self.indent += 1;
 
-        // Build local type map for expression emission.
+        // Build local type map.
         let mut locals: HashMap<String, ValTy> = HashMap::new();
         locals.insert("self".to_string(), ValTy::I32);
         for p in &method.params {
@@ -599,19 +1208,61 @@ impl WatGen {
             locals.insert(name.clone(), *vt);
         }
 
-        // Declare node locals (one i32 per IrExpr::Node in DFS order).
+        // Declare node locals (one i32 per IrExpr::Node).
         let node_count = count_nodes_in_stmts(&method.body);
         for i in 0..node_count {
             self.ln(&format!("(local $__node_{} i32)", i));
             locals.insert(format!("__node_{}", i), ValTy::I32);
         }
 
-        // Reset node counter before emission so indices match declarations.
+        // GC helper locals — always declared.
+        self.ln("(local $__rv_i32 i32)");  // return-value scratch for shadow cleanup
+        self.ln("(local $__rv_i64 i64)");
+        self.ln("(local $__wb_obj i32)");  // write-barrier temporaries
+        self.ln("(local $__wb_val i32)");
+
+        // Set up shadow stack: push $self and any pointer-typed params.
+        let ptr_param_names: Vec<String> = std::iter::once("self".to_string())
+            .chain(
+                method
+                    .params
+                    .iter()
+                    .filter(|p| ir_to_val(&p.ty) == ValTy::I32)
+                    .map(|p| p.name.clone()),
+            )
+            .collect();
+
+        self.shadow_frame_depth = ptr_param_names.len();
+        self.current_return_vt = if method.return_ty == IrType::Void {
+            None
+        } else {
+            Some(ir_to_val(&method.return_ty))
+        };
+
+        if !ptr_param_names.is_empty() {
+            self.comment("Push GC roots to shadow stack");
+            for name in &ptr_param_names {
+                self.ln(&format!("(call $gc_shadow_push (local.get ${}))", name));
+            }
+        }
+
+        // Reset node counter before emission.
         self.node_idx = 0;
         self.emit_stmts(&method.body.clone(), &locals)?;
 
+        // Shadow stack cleanup at the normal end of the method (handles void methods
+        // and non-void methods that have no explicit return, e.g., unreachable paths).
+        if self.shadow_frame_depth > 0 {
+            self.comment("Shadow stack cleanup (end of method)");
+            for _ in 0..self.shadow_frame_depth {
+                self.ln("(drop (call $gc_shadow_pop))");
+            }
+        }
+
         self.ln(")");
         self.indent -= 1;
+        self.shadow_frame_depth = 0;
+        self.current_return_vt = None;
         Ok(())
     }
 
@@ -639,7 +1290,6 @@ impl WatGen {
                 self.ln(&format!("local.set ${}", name));
             }
             IrStmt::Assign { target, value } => {
-                // Stack: addr, value → store.
                 match target {
                     IrExpr::Field { receiver, name } => {
                         let cls = self.current_class.clone();
@@ -648,9 +1298,26 @@ impl WatGen {
                             .get(&cls)
                             .and_then(|l| l.get(name))
                             .unwrap_or((0, ValTy::I32));
-                        self.emit_expr(receiver, locals)?;
-                        self.emit_expr(value, locals)?;
-                        self.ln(&vt.store(offset));
+
+                        if vt == ValTy::I32 {
+                            // Pointer store: emit write barrier via $__wb_obj / $__wb_val.
+                            // local.tee leaves the value on the stack AND saves to the local.
+                            self.emit_expr(receiver, locals)?;
+                            self.ln("local.tee $__wb_obj");
+                            self.emit_expr(value, locals)?;
+                            self.ln("local.tee $__wb_val");
+                            // Stack: [obj_ptr, val] — $gc_write_barrier consumes both.
+                            self.ln("call $gc_write_barrier");
+                            // Reload from saved locals for the actual store.
+                            self.ln("local.get $__wb_obj");
+                            self.ln("local.get $__wb_val");
+                            self.ln(&vt.store(offset));
+                        } else {
+                            // Non-pointer store (e.g., i64 Int field): no write barrier.
+                            self.emit_expr(receiver, locals)?;
+                            self.emit_expr(value, locals)?;
+                            self.ln(&vt.store(offset));
+                        }
                     }
                     _ => {
                         self.emit_expr(value, locals)?;
@@ -659,10 +1326,26 @@ impl WatGen {
                 }
             }
             IrStmt::Return(None) => {
+                self.emit_shadow_cleanup();
                 self.ln("return");
             }
             IrStmt::Return(Some(e)) => {
                 self.emit_expr(e, locals)?;
+                if self.shadow_frame_depth > 0 {
+                    // Save return value while we clean up the shadow stack.
+                    match self.current_return_vt {
+                        Some(ValTy::I64) => {
+                            self.ln("local.set $__rv_i64");
+                            self.emit_shadow_cleanup();
+                            self.ln("local.get $__rv_i64");
+                        }
+                        _ => {
+                            self.ln("local.set $__rv_i32");
+                            self.emit_shadow_cleanup();
+                            self.ln("local.get $__rv_i32");
+                        }
+                    }
+                }
                 self.ln("return");
             }
             IrStmt::Discard(e) => {
@@ -673,8 +1356,6 @@ impl WatGen {
             }
             IrStmt::If { cond, then_body, else_body } => {
                 self.emit_expr(cond, locals)?;
-                // Ensure i32 on stack (WASM if needs i32).
-                // Comparisons and logical ops already produce i32; Int values need a cast.
                 let cond_ty = self.infer_valtype(cond, locals);
                 if cond_ty == ValTy::I64 {
                     self.ln("i64.const 0");
@@ -721,7 +1402,6 @@ impl WatGen {
                 self.ln("end");
             }
             IrStmt::For { var, iter, body } => {
-                // `for var in iter` — requires JS-side iterator; emit structural loop.
                 let idx = self.loop_idx;
                 self.loop_idx += 1;
                 self.comment(&format!("for {} in iter — iterator needs JS interop", var));
@@ -751,6 +1431,13 @@ impl WatGen {
         Ok(())
     }
 
+    /// Emit shadow-stack pops (called before every `return` and at function end).
+    fn emit_shadow_cleanup(&mut self) {
+        for _ in 0..self.shadow_frame_depth {
+            self.ln("(drop (call $gc_shadow_pop))");
+        }
+    }
+
     // ── Expression emission ───────────────────────────────────────────────────
     //
     // Returns `true` if the expression leaves a value on the WASM stack.
@@ -778,8 +1465,11 @@ impl WatGen {
                 self.ln(&format!("local.get ${}", name));
                 true
             }
+            // SelfRef: always go through gc_reload_if_forwarded so that if
+            // a constructor call in this method triggered GC and moved $self,
+            // we transparently get the forwarded address.
             IrExpr::SelfRef => {
-                self.ln("local.get $self");
+                self.ln("(call $gc_reload_if_forwarded (local.get $self))");
                 true
             }
             IrExpr::Field { receiver, name } => {
@@ -815,18 +1505,15 @@ impl WatGen {
                 true
             }
             IrExpr::Call { receiver, method, args } => {
-                // Push self (receiver) then each argument.
                 self.emit_expr(receiver, locals)?;
                 for arg in args {
                     self.emit_expr(arg, locals)?;
                 }
                 let cls = self.current_class.clone();
                 self.ln(&format!("call ${}_{}", cls, method));
-                // Return false (no stack value) if method is known-void.
                 !self.void_methods.contains(&(cls, method.clone()))
             }
             IrExpr::Invoke { callee, args } => {
-                // Constructor: push args, call $Callee_new → i32 pointer.
                 for arg in args {
                     self.emit_expr(arg, locals)?;
                 }
@@ -834,7 +1521,6 @@ impl WatGen {
                 true // constructors always return i32
             }
             IrExpr::Node { tag, children } => {
-                // Create element, optionally set text / append child nodes.
                 let tag_off = self.pool.index.get(tag.as_str()).copied().unwrap_or(0);
                 let node_local = format!("$__node_{}", self.node_idx);
                 self.node_idx += 1;
@@ -845,14 +1531,12 @@ impl WatGen {
 
                 for child in children {
                     if let IrExpr::Str(s) = child {
-                        // String child → set text content.
                         let str_off =
                             self.pool.index.get(s.as_str()).copied().unwrap_or(0);
                         self.ln(&format!("local.get {}  ;; element", node_local));
                         self.ln(&format!("i32.const {}  ;; \"{}\"", str_off, s.escape_default()));
                         self.ln("call $env_dom_set_text_content");
                     } else {
-                        // DOM child → append.
                         self.ln(&format!("local.get {}  ;; parent", node_local));
                         let child_pushes = self.emit_expr(child, locals)?;
                         if child_pushes {
@@ -865,17 +1549,17 @@ impl WatGen {
                 true
             }
             IrExpr::Closure { .. } => {
-                // Function-references proposal not assumed — emit a null ref placeholder.
                 self.ln(
                     "i32.const 0  ;; closure (function-references not yet supported)",
                 );
                 true
             }
-            // Await / list / dynamic-import are JS-target concepts; emit null in WASM.
+            // Await: passthrough — actual async is a JS concept; WAT sees the value directly.
             IrExpr::Await(inner) => {
                 self.emit_expr(inner, locals)?;
-                false // value stays on stack (passthrough)
+                true
             }
+            // List and DynamicImport are JS-target concepts; emit null in WASM.
             IrExpr::List(_) => {
                 self.ln("i32.const 0  ;; list (not yet supported in WASM backend)");
                 true
@@ -901,10 +1585,12 @@ impl WatGen {
                 .and_then(|l| l.get(name))
                 .map(|(_, vt)| vt)
                 .unwrap_or(ValTy::I32),
-            IrExpr::Bin { op: IrBinOp::Add | IrBinOp::Sub | IrBinOp::Mul | IrBinOp::Div | IrBinOp::Mod, lhs, .. } => {
-                self.infer_valtype(lhs, locals)
-            }
-            IrExpr::Bin { .. } => ValTy::I32, // comparisons and logical → bool (i32)
+            IrExpr::Bin {
+                op: IrBinOp::Add | IrBinOp::Sub | IrBinOp::Mul | IrBinOp::Div | IrBinOp::Mod,
+                lhs,
+                ..
+            } => self.infer_valtype(lhs, locals),
+            IrExpr::Bin { .. } => ValTy::I32, // comparisons/logical → bool (i32)
             IrExpr::Unary { op, .. } => match op {
                 IrUnOp::Not => ValTy::I32,
                 IrUnOp::Neg => ValTy::I64,
@@ -922,7 +1608,11 @@ impl WatGen {
         self.indent += 1;
 
         let app_sel_off = self.pool.index.get("#app").copied().unwrap_or(0);
-        let main_win = module.routes.iter().find(|r| r.path == "/").map(|r| r.target.as_str());
+        let main_win = module
+            .routes
+            .iter()
+            .find(|r| r.path == "/")
+            .map(|r| r.target.as_str());
 
         if let Some(win) = main_win {
             self.ln("(local $root_el i32)");
@@ -986,11 +1676,18 @@ fn binop_instr(op: &IrBinOp, lhs_ty: ValTy) -> &'static str {
     }
 }
 
+// ── Shape data type alias ─────────────────────────────────────────────────────
+
+/// Per-class shape descriptor: `(tag, class_name, total_size, pointer_fields)`.
+/// `pointer_fields` is a list of `(field_offset, field_name)` for i32 fields.
+type ClassShape = (u32, String, u32, Vec<(u32, String)>);
+
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /// WASM backend: lowers an [`IrModule`] to WebAssembly Text format (WAT).
 ///
-/// Assemble the resulting WAT with `wat2wasm app.wat -o app.wasm`.
+/// The output requires the **bulk-memory** WASM proposal for `memory.copy`.
+/// Assemble with: `wat2wasm --enable-bulk-memory app.wat -o app.wasm`
 pub struct WasmCodegen;
 
 impl WasmCodegen {
@@ -1046,7 +1743,7 @@ mod tests {
                             name: "count".into(),
                         }))],
                         is_public: true,
-            is_async: false,
+                        is_async: false,
                     },
                     IrMethod {
                         name: "increment".into(),
@@ -1067,7 +1764,7 @@ mod tests {
                             },
                         }],
                         is_public: true,
-            is_async: false,
+                        is_async: false,
                     },
                 ],
             }],
@@ -1098,7 +1795,7 @@ mod tests {
                         }],
                     }))],
                     is_public: true,
-            is_async: false,
+                    is_async: false,
                 }],
             }],
             routes: vec![IrRoute { path: "/".into(), target: "HomePage".into() }],
@@ -1109,11 +1806,12 @@ mod tests {
         WasmCodegen::new().generate_wat(ir).unwrap()
     }
 
+    // ── Existing tests (backward compat) ─────────────────────────────────────
+
     #[test]
     fn output_starts_and_ends_as_module() {
         let w = wat(&counter_ir());
         assert!(w.contains("(module"), "should open with (module");
-        // Last non-empty line should close it.
         let last = w.lines().filter(|l| !l.trim().is_empty()).last().unwrap_or("");
         assert_eq!(last, ")", "should close module with )");
     }
@@ -1136,6 +1834,7 @@ mod tests {
     #[test]
     fn output_has_alloc() {
         let w = wat(&counter_ir());
+        // Legacy wrappers are kept for backward compat.
         assert!(w.contains("$__alloc"), "__alloc function missing");
         assert!(w.contains("$__heap_ptr"), "__heap_ptr global missing");
     }
@@ -1210,12 +1909,92 @@ mod tests {
                     return_ty: IrType::Bool,
                     body: vec![IrStmt::Return(Some(IrExpr::Bool(true)))],
                     is_public: true,
-            is_async: false,
+                    is_async: false,
                 }],
             }],
             routes: vec![],
         };
         let w = wat(&ir);
         assert!(w.contains("i32.const 1"), "true should be i32.const 1");
+    }
+
+    // ── New GC tests ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn gc_alloc_function_present() {
+        let w = wat(&counter_ir());
+        assert!(w.contains("$gc_alloc"), "$gc_alloc function missing");
+        assert!(w.contains("$__gc_from_ptr"), "from-space pointer global missing");
+    }
+
+    #[test]
+    fn gc_object_header_written_in_constructor() {
+        let w = wat(&counter_ir());
+        // Constructor must store the type tag at offset +0 (i32.store with no offset).
+        assert!(
+            w.contains("i32.store (local.get $ptr) (local.get $tag)"),
+            "type tag not written in header"
+        );
+        // The Int field 'count' is now at offset 8 (after 8-byte header).
+        assert!(
+            w.contains("i64.store offset=8"),
+            "Int field should be at offset 8 (after header)"
+        );
+    }
+
+    #[test]
+    fn gc_minor_collect_present() {
+        let w = wat(&counter_ir());
+        assert!(w.contains("$gc_minor_collect"), "$gc_minor_collect missing");
+        assert!(w.contains("$gc_copy"), "$gc_copy missing");
+        assert!(w.contains("memory.copy"), "memory.copy instruction missing");
+    }
+
+    #[test]
+    fn gc_write_barrier_present() {
+        let w = wat(&counter_ir());
+        assert!(w.contains("$gc_write_barrier"), "$gc_write_barrier missing");
+        assert!(w.contains("$__gc_rset_ptr"), "remembered-set pointer missing");
+    }
+
+    #[test]
+    fn gc_shadow_stack_present() {
+        let w = wat(&counter_ir());
+        assert!(w.contains("$gc_shadow_push"), "$gc_shadow_push missing");
+        assert!(w.contains("$gc_shadow_pop"), "$gc_shadow_pop missing");
+        assert!(w.contains("$__gc_shadow_ptr"), "shadow stack pointer missing");
+    }
+
+    #[test]
+    fn gc_self_reload_via_forwarded() {
+        // SelfRef in a method must go through $gc_reload_if_forwarded so that
+        // if GC moved the object during an allocation in this method, we still
+        // access the right address.
+        let w = wat(&counter_ir());
+        assert!(
+            w.contains("$gc_reload_if_forwarded"),
+            "$gc_reload_if_forwarded missing"
+        );
+    }
+
+    #[test]
+    fn gc_semi_spaces_are_page_aligned() {
+        // Nursery from-space must start at a 64 KiB page boundary (≥ page 1).
+        let w = wat(&counter_ir());
+        assert!(
+            w.contains("65536"),
+            "nursery from-space should start at page 1 (65536)"
+        );
+        // To-space follows immediately after (2 pages × 64 KiB = 128 KiB later).
+        assert!(w.contains("196608"), "nursery to-space start (196608) missing");
+        // Old generation starts after both nursery semi-spaces.
+        assert!(w.contains("327680"), "old-gen start (327680) missing");
+    }
+
+    #[test]
+    fn gc_shape_map_emits_object_size() {
+        let w = wat(&counter_ir());
+        assert!(w.contains("$gc_object_size"), "$gc_object_size missing");
+        assert!(w.contains("$gc_scan_object"), "$gc_scan_object missing");
     }
 }
