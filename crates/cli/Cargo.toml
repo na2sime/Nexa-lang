@@ -19,6 +19,9 @@ serde_yaml    = "0.9"
 thiserror     = "1"
 notify        = "6"
 sha2          = "0.10"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+base64        = "0.22"
+rand          = "0.8"
 zip           = "2.1"
 reqwest       = { version = "0.12", default-features = false, features = ["blocking", "multipart", "json", "rustls-tls"] }
 tracing            = { workspace = true }

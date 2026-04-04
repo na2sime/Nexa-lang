@@ -130,7 +130,6 @@ impl CompilerConfig {
 
     /// Returns the list of modules that should be compiled, applying
     /// `include_modules` / `exclude_modules` filters.
-    #[allow(dead_code)] // will be used by multi-module build
     pub fn active_modules<'a>(&'a self, all_modules: &'a [String]) -> Vec<&'a str> {
         if let Some(include) = &self.include_modules {
             return include.iter().map(String::as_str).collect();
@@ -312,6 +311,7 @@ impl NexaProject {
     }
 
     /// Returns `<root>/.nexa/<name>/` — compiler cache for a module.
+    #[allow(dead_code)]
     pub fn nexa_cache_dir(&self, name: &str) -> PathBuf {
         self.root.join(".nexa").join(name)
     }

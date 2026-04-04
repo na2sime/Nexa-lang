@@ -43,8 +43,12 @@ async fn main() -> anyhow::Result<()> {
     let package_store = Arc::new(PgPackageStore::new(pool));
 
     let state = AppState {
-        auth: Arc::new(AuthService::new(user_store, token_store, jwt_secret)),
-        packages: Arc::new(PackagesService::new(package_store)),
+        auth: Arc::new(AuthService::new(
+            user_store.clone(),
+            token_store,
+            jwt_secret,
+        )),
+        packages: Arc::new(PackagesService::new(package_store, user_store)),
     };
 
     let router = build_router(state);

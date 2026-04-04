@@ -205,6 +205,22 @@ async fn publish(
         }
     };
 
+    // Require Ed25519 signing headers
+    let ed25519_pubkey = match headers
+        .get("x-nexa-signing-key")
+        .and_then(|v| v.to_str().ok())
+    {
+        Some(v) => v.to_string(),
+        None => return err(StatusCode::BAD_REQUEST, "missing X-Nexa-Signing-Key header"),
+    };
+    let ed25519_sig = match headers
+        .get("x-nexa-signature")
+        .and_then(|v| v.to_str().ok())
+    {
+        Some(v) => v.to_string(),
+        None => return err(StatusCode::BAD_REQUEST, "missing X-Nexa-Signature header"),
+    };
+
     // Read the first multipart field (the .nexa bundle)
     let bundle_bytes = match multipart.next_field().await {
         Ok(Some(field)) => match field.bytes().await {
@@ -223,7 +239,11 @@ async fn publish(
     }
 
     let bundle_size = bundle_bytes.len();
-    match state.packages.publish(&name, user_id, bundle_bytes).await {
+    match state
+        .packages
+        .publish(&name, user_id, bundle_bytes, &ed25519_pubkey, &ed25519_sig)
+        .await
+    {
         Ok(v) => {
             tracing::info!(
                 package = %name,

@@ -12,6 +12,9 @@ use crate::domain::{
 pub trait UserStore: Send + Sync {
     async fn create(&self, email: &str, password_hash: &str) -> Result<User>;
     async fn find_by_email(&self, email: &str) -> Result<Option<User>>;
+    async fn find_by_id(&self, id: Uuid) -> Result<Option<User>>;
+    /// Store or update the user's Ed25519 public key (base64).
+    async fn set_signing_key(&self, id: Uuid, pubkey: &str) -> Result<()>;
 }
 
 #[async_trait]

@@ -1,4 +1,4 @@
-use crate::application::{config, credentials, project::NexaProject, updater};
+use crate::application::{config, credentials, project::NexaProject, signing, updater};
 use crate::infrastructure::ui;
 use nexa_compiler::{compile_project_file, compile_to_bundle, decode_nxb, CodeGenerator};
 use nexa_server::{build_router, AppState};
@@ -229,23 +229,33 @@ mod init_tests {
 pub fn build(project_dir: Option<PathBuf>) {
     updater::check_and_notify("stable");
     let proj = load_project(project_dir);
-    let mod_name = proj.main_module_name().to_string();
-    let sp = ui::spinner(format!("Compiling module '{mod_name}'…"));
-    match compile_project_file(
-        &proj.main_entry(),
-        &proj.main_src_root(),
-        proj.root(),
-        &mod_name,
-    ) {
-        Ok(result) => {
-            write_dist(&proj.dist_dir(&mod_name), result);
-            ui::done(
-                &sp,
-                format!("Build OK  →  {}", proj.dist_dir(&mod_name).display()),
-            );
+    let modules = proj
+        .compiler
+        .active_modules(&proj.project.modules)
+        .iter()
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>();
+
+    for mod_name in &modules {
+        let sp = ui::spinner(format!("Compiling module '{mod_name}'…"));
+        match compile_project_file(
+            &proj.module_entry(mod_name),
+            &proj.module_src_root(mod_name),
+            proj.root(),
+            mod_name,
+        ) {
+            Ok(result) => {
+                write_dist(&proj.dist_dir(mod_name), result);
+                ui::done(
+                    &sp,
+                    format!("  {mod_name}  →  {}", proj.dist_dir(mod_name).display()),
+                );
+            }
+            Err(e) => ui::fail(&sp, e.to_string()),
         }
-        Err(e) => ui::fail(&sp, e.to_string()),
     }
+
+    ui::info(format!("Build OK — {} module(s) compiled", modules.len()));
 }
 
 pub async fn run(
@@ -701,16 +711,25 @@ pub fn publish(
         let mut zip = zip::ZipWriter::new(file);
         let opts: zip::write::FileOptions<'_, ()> =
             zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
-        zip.start_file("app.nxb", opts).unwrap();
-        zip.write_all(&bundle.nxb).unwrap();
-        zip.start_file("manifest.json", opts).unwrap();
-        zip.write_all(bundle.manifest.as_bytes()).unwrap();
-        zip.start_file("signature.sig", opts).unwrap();
-        zip.write_all(bundle.signature.as_bytes()).unwrap();
+        zip.start_file("app.nxb", opts)
+            .unwrap_or_else(|e| ui::fail(&sp, format!("ZIP: {e}")));
+        zip.write_all(&bundle.nxb)
+            .unwrap_or_else(|e| ui::fail(&sp, format!("ZIP write nxb: {e}")));
+        zip.start_file("manifest.json", opts)
+            .unwrap_or_else(|e| ui::fail(&sp, format!("ZIP: {e}")));
+        zip.write_all(bundle.manifest.as_bytes())
+            .unwrap_or_else(|e| ui::fail(&sp, format!("ZIP write manifest: {e}")));
+        zip.start_file("signature.sig", opts)
+            .unwrap_or_else(|e| ui::fail(&sp, format!("ZIP: {e}")));
+        zip.write_all(bundle.signature.as_bytes())
+            .unwrap_or_else(|e| ui::fail(&sp, format!("ZIP write signature: {e}")));
         let src_entry = format!("src/{}", bundle.source_filename);
-        zip.start_file(&src_entry, opts).unwrap();
-        zip.write_all(bundle.source.as_bytes()).unwrap();
-        zip.finish().unwrap();
+        zip.start_file(&src_entry, opts)
+            .unwrap_or_else(|e| ui::fail(&sp, format!("ZIP: {e}")));
+        zip.write_all(bundle.source.as_bytes())
+            .unwrap_or_else(|e| ui::fail(&sp, format!("ZIP write source: {e}")));
+        zip.finish()
+            .unwrap_or_else(|e| ui::fail(&sp, format!("ZIP finalize: {e}")));
     }
 
     sp.set_message(format!(
@@ -721,16 +740,23 @@ pub fn publish(
     let file_bytes = fs::read(&tmp_path).unwrap_or_else(|e| ui::fail(&sp, e.to_string()));
     let _ = fs::remove_file(&tmp_path);
 
+    // Sign the bundle with the user's Ed25519 key (auto-generated on first publish)
+    let signing_key = signing::load_or_generate();
+    let pubkey_b64 = signing::public_key_b64(&signing_key);
+    let sig_b64 = signing::sign_bundle(&signing_key, &file_bytes);
+
     let client = reqwest::blocking::Client::new();
     let part = reqwest::blocking::multipart::Part::bytes(file_bytes)
         .file_name(format!("{app_name}.nexa"))
         .mime_str("application/octet-stream")
-        .unwrap();
+        .unwrap_or_else(|e| ui::fail(&sp, format!("MIME type error: {e}")));
     let form = reqwest::blocking::multipart::Form::new().part("file", part);
 
     match client
         .post(&url)
         .bearer_auth(&creds.token)
+        .header("X-Nexa-Signing-Key", &pubkey_b64)
+        .header("X-Nexa-Signature", &sig_b64)
         .multipart(form)
         .send()
     {

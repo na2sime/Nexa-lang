@@ -19,6 +19,7 @@ struct UserRow {
     email: String,
     password_hash: String,
     created_at: DateTime<Utc>,
+    signing_key: Option<String>,
 }
 
 #[derive(FromRow)]
@@ -47,6 +48,7 @@ impl From<UserRow> for User {
             email: r.email,
             password_hash: r.password_hash,
             created_at: r.created_at,
+            signing_key: r.signing_key,
         }
     }
 }
@@ -118,7 +120,7 @@ impl UserStore for PgUserStore {
     async fn create(&self, email: &str, password_hash: &str) -> Result<User> {
         let row = sqlx::query_as::<_, UserRow>(
             "INSERT INTO users (email, password_hash) VALUES ($1, $2)
-             RETURNING id, email, password_hash, created_at",
+             RETURNING id, email, password_hash, created_at, signing_key",
         )
         .bind(email)
         .bind(password_hash)
@@ -130,13 +132,34 @@ impl UserStore for PgUserStore {
 
     async fn find_by_email(&self, email: &str) -> Result<Option<User>> {
         let row = sqlx::query_as::<_, UserRow>(
-            "SELECT id, email, password_hash, created_at FROM users WHERE email = $1",
+            "SELECT id, email, password_hash, created_at, signing_key FROM users WHERE email = $1",
         )
         .bind(email)
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| anyhow!("find user: {e}"))?;
         Ok(row.map(Into::into))
+    }
+
+    async fn find_by_id(&self, id: Uuid) -> Result<Option<User>> {
+        let row = sqlx::query_as::<_, UserRow>(
+            "SELECT id, email, password_hash, created_at, signing_key FROM users WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| anyhow!("find user by id: {e}"))?;
+        Ok(row.map(Into::into))
+    }
+
+    async fn set_signing_key(&self, id: Uuid, pubkey: &str) -> Result<()> {
+        sqlx::query("UPDATE users SET signing_key = $1 WHERE id = $2")
+            .bind(pubkey)
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| anyhow!("set signing key: {e}"))?;
+        Ok(())
     }
 }
 
