@@ -1,7 +1,8 @@
 use axum::{
+    async_trait,
     body::Bytes,
-    extract::{Multipart, Path, Query, State},
-    http::{header, HeaderMap, Method, StatusCode},
+    extract::{FromRequestParts, Multipart, Path, Query, State},
+    http::{header, request::Parts, HeaderMap, Method, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -12,6 +13,31 @@ use tower_governor::{governor::GovernorConfigBuilder, GovernorLayer};
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 
 use crate::application::services::{auth::AuthService, packages::PackagesService};
+
+// ── Auth extractor ────────────────────────────────────────────────────────────
+
+/// Axum extractor that validates a Bearer token and resolves the caller's user ID.
+/// Eliminates the repeated 6-line token-check block from every protected handler.
+struct AuthUser(uuid::Uuid);
+
+#[async_trait]
+impl FromRequestParts<AppState> for AuthUser {
+    type Rejection = Response;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let token = extract_bearer(&parts.headers)
+            .ok_or_else(|| err(StatusCode::UNAUTHORIZED, "missing Authorization header"))?;
+        let user_id = state
+            .auth
+            .verify_token(&token)
+            .await
+            .map_err(|_| err(StatusCode::UNAUTHORIZED, "invalid or expired token"))?;
+        Ok(AuthUser(user_id))
+    }
+}
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -183,6 +209,7 @@ async fn login(State(state): State<AppState>, Json(body): Json<AuthBody>) -> Res
 
 async fn publish(
     State(state): State<AppState>,
+    AuthUser(user_id): AuthUser,
     headers: HeaderMap,
     Path(name): Path<String>,
     mut multipart: Multipart,
@@ -193,21 +220,6 @@ async fn publish(
             "invalid package name: use letters, digits, hyphens, underscores or dots (max 214 chars)",
         );
     }
-
-    let token = match extract_bearer(&headers) {
-        Some(t) => t,
-        None => {
-            tracing::warn!(package = %name, "Publish rejected: missing token");
-            return err(StatusCode::UNAUTHORIZED, "missing Authorization header");
-        }
-    };
-    let user_id = match state.auth.verify_token(&token).await {
-        Ok(id) => id,
-        Err(e) => {
-            tracing::warn!(package = %name, error = %e, "Publish rejected: invalid token");
-            return err(StatusCode::UNAUTHORIZED, "invalid or expired token");
-        }
-    };
 
     // Require Ed25519 signing headers
     let ed25519_pubkey = match headers
@@ -495,17 +507,9 @@ struct TokenListItem {
 
 async fn create_token(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    AuthUser(user_id): AuthUser,
     Json(body): Json<CreateTokenBody>,
 ) -> Response {
-    let bearer = match extract_bearer(&headers) {
-        Some(t) => t,
-        None => return err(StatusCode::UNAUTHORIZED, "missing Authorization header"),
-    };
-    let user_id = match state.auth.verify_token(&bearer).await {
-        Ok(id) => id,
-        Err(e) => return err(StatusCode::UNAUTHORIZED, &e.to_string()),
-    };
     match state.auth.create_api_token(user_id, &body.name).await {
         Ok((raw, record)) => {
             tracing::info!(user_id = %user_id, name = %body.name, "API token created");
@@ -524,15 +528,10 @@ async fn create_token(
     }
 }
 
-async fn list_tokens(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    let bearer = match extract_bearer(&headers) {
-        Some(t) => t,
-        None => return err(StatusCode::UNAUTHORIZED, "missing Authorization header"),
-    };
-    let user_id = match state.auth.verify_token(&bearer).await {
-        Ok(id) => id,
-        Err(e) => return err(StatusCode::UNAUTHORIZED, &e.to_string()),
-    };
+async fn list_tokens(
+    State(state): State<AppState>,
+    AuthUser(user_id): AuthUser,
+) -> Response {
     match state.auth.list_api_tokens(user_id).await {
         Ok(tokens) => {
             let items: Vec<TokenListItem> = tokens
@@ -552,17 +551,9 @@ async fn list_tokens(State(state): State<AppState>, headers: HeaderMap) -> Respo
 
 async fn revoke_token(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    AuthUser(user_id): AuthUser,
     Path(id): Path<uuid::Uuid>,
 ) -> Response {
-    let bearer = match extract_bearer(&headers) {
-        Some(t) => t,
-        None => return err(StatusCode::UNAUTHORIZED, "missing Authorization header"),
-    };
-    let user_id = match state.auth.verify_token(&bearer).await {
-        Ok(uid) => uid,
-        Err(e) => return err(StatusCode::UNAUTHORIZED, &e.to_string()),
-    };
     match state.auth.revoke_api_token(id, user_id).await {
         Ok(true) => {
             tracing::info!(token_id = %id, user_id = %user_id, "API token revoked");
