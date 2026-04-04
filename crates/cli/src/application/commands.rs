@@ -236,6 +236,7 @@ pub fn build(project_dir: Option<PathBuf>) {
         .map(|s| s.to_string())
         .collect::<Vec<_>>();
 
+    let mut lock_entries: Vec<(String, Vec<BuildLockEntry>)> = Vec::new();
     for mod_name in &modules {
         let sp = ui::spinner(format!("Compiling module '{mod_name}'…"));
         match compile_project_file(
@@ -250,11 +251,17 @@ pub fn build(project_dir: Option<PathBuf>) {
                     &sp,
                     format!("  {mod_name}  →  {}", proj.dist_dir(mod_name).display()),
                 );
+                let sources =
+                    fingerprint_module_sources(&proj.module_src_root(mod_name), proj.root());
+                lock_entries.push((mod_name.clone(), sources));
             }
             Err(e) => ui::fail(&sp, e.to_string()),
         }
     }
 
+    let refs: Vec<(&str, Vec<BuildLockEntry>)> =
+        lock_entries.iter().map(|(n, e)| (n.as_str(), e.clone())).collect();
+    save_build_lock(proj.root(), &refs);
     ui::info(format!("Build OK — {} module(s) compiled", modules.len()));
 }
 
@@ -513,7 +520,7 @@ pub fn register(registry_override: Option<String>) {
     let password = ui::password("Password");
 
     let sp = ui::spinner(format!("Creating account on {registry}…"));
-    let url = format!("{registry}/auth/register");
+    let url = format!("{registry}/v1/auth/register");
     match post_json(
         &url,
         &serde_json::json!({ "email": email, "password": password }),
@@ -541,7 +548,7 @@ pub fn login(registry_override: Option<String>) {
     let password = ui::password("Password");
 
     let sp = ui::spinner(format!("Authenticating with {registry}…"));
-    let url = format!("{registry}/auth/login");
+    let url = format!("{registry}/v1/auth/login");
     match post_json(
         &url,
         &serde_json::json!({ "email": email, "password": password }),
@@ -568,7 +575,7 @@ pub fn token_create(name: String, registry_override: Option<String>) {
     let registry = registry_override.unwrap_or(creds.registry.clone());
 
     let sp = ui::spinner(format!("Creating token '{name}' on {registry}…"));
-    let url = format!("{registry}/auth/tokens");
+    let url = format!("{registry}/v1/auth/tokens");
     match post_json(
         &url,
         &serde_json::json!({ "name": name }),
@@ -604,7 +611,7 @@ pub fn token_list(registry_override: Option<String>) {
 
     let sp = ui::spinner(format!("Fetching tokens from {registry}…"));
     let client = reqwest::blocking::Client::new();
-    let url = format!("{registry}/auth/tokens");
+    let url = format!("{registry}/v1/auth/tokens");
     let result = client
         .get(&url)
         .bearer_auth(&creds.token)
@@ -655,7 +662,7 @@ pub fn token_revoke(id: String, registry_override: Option<String>) {
 
     let sp = ui::spinner(format!("Revoking token {id}…"));
     let client = reqwest::blocking::Client::new();
-    let url = format!("{registry}/auth/tokens/{id}");
+    let url = format!("{registry}/v1/auth/tokens/{id}");
     match client.delete(&url).bearer_auth(&creds.token).send() {
         Ok(resp) if resp.status() == 204 => {
             ui::done(&sp, format!("Token {id} revoked."));
@@ -736,7 +743,7 @@ pub fn publish(
         "Publishing {bundle_name}@{app_version} to {registry}…"
     ));
 
-    let url = format!("{registry}/packages/{bundle_name}/publish");
+    let url = format!("{registry}/v1/packages/{bundle_name}/publish");
     let file_bytes = fs::read(&tmp_path).unwrap_or_else(|e| ui::fail(&sp, e.to_string()));
     let _ = fs::remove_file(&tmp_path);
 
@@ -883,7 +890,7 @@ pub fn search(query: Option<String>, registry_override: Option<String>, limit: u
     let q = query.clone().unwrap_or_default();
     let sp = ui::spinner(format!("Searching {registry}…"));
 
-    let url = format!("{registry}/packages?q={q}&per_page={limit}");
+    let url = format!("{registry}/v1/packages?q={q}&per_page={limit}");
     let result = reqwest::blocking::get(&url).and_then(|r| r.json::<serde_json::Value>());
 
     sp.finish_and_clear();
@@ -936,7 +943,7 @@ pub fn info(package: String, registry_override: Option<String>) {
         .unwrap_or_else(|| DEFAULT_REGISTRY.to_string());
 
     let sp = ui::spinner(format!("Fetching info for {package}…"));
-    let url = format!("{registry}/packages/{package}");
+    let url = format!("{registry}/v1/packages/{package}");
     let result = reqwest::blocking::get(&url).and_then(|r| r.json::<serde_json::Value>());
 
     sp.finish_and_clear();
@@ -1164,7 +1171,7 @@ fn try_download(
 ) -> Option<(String, Vec<u8>)> {
     let client = reqwest::blocking::Client::new();
     for (url, key) in registries {
-        let endpoint = format!("{url}/packages/{name}/{version}/download");
+        let endpoint = format!("{url}/v1/packages/{name}/{version}/download");
         let mut req = client.get(&endpoint);
         if let Some(k) = key {
             req = req.header("X-Api-Key", k);
@@ -1417,4 +1424,78 @@ pub fn write_dist(dist_dir: &Path, result: nexa_compiler::CompileResult) {
     fs::create_dir_all(dist_dir).expect("cannot create dist/");
     fs::write(dist_dir.join("index.html"), &result.html).expect("cannot write index.html");
     fs::write(dist_dir.join("app.js"), &result.js).expect("cannot write app.js");
+}
+
+// ── Compiler build lockfile ───────────────────────────────────────────────────
+
+/// One source-file entry in `nexa-build.lock`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+struct BuildLockEntry {
+    /// Path relative to the project root.
+    path: String,
+    /// SHA-256 hex of the file contents at build time.
+    sha256: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+struct BuildLockfile {
+    /// Nexa CLI version that produced this lock.
+    nexa_version: String,
+    /// Per-module source file fingerprints.
+    modules: std::collections::HashMap<String, Vec<BuildLockEntry>>,
+}
+
+/// Scan all `.nx` files under `src_root`, compute their SHA-256, and return
+/// them as `BuildLockEntry` list (paths relative to `project_root`).
+fn fingerprint_module_sources(src_root: &Path, project_root: &Path) -> Vec<BuildLockEntry> {
+    use sha2::{Digest, Sha256};
+    let mut entries = Vec::new();
+    let Ok(walk) = fs::read_dir(src_root) else {
+        return entries;
+    };
+    let mut queue: Vec<_> = walk.flatten().collect();
+    while let Some(entry) = queue.pop() {
+        let p = entry.path();
+        if p.is_dir() {
+            if let Ok(sub) = fs::read_dir(&p) {
+                queue.extend(sub.flatten());
+            }
+        } else if p.extension().map(|e| e == "nx").unwrap_or(false) {
+            if let Ok(bytes) = fs::read(&p) {
+                let mut h = Sha256::new();
+                h.update(&bytes);
+                let sha256 = hex::encode(h.finalize());
+                let rel = p
+                    .strip_prefix(project_root)
+                    .unwrap_or(&p)
+                    .to_string_lossy()
+                    .into_owned();
+                entries.push(BuildLockEntry { path: rel, sha256 });
+            }
+        }
+    }
+    entries.sort_by(|a, b| a.path.cmp(&b.path));
+    entries
+}
+
+/// Write / update `nexa-build.lock` at the project root after a successful build.
+fn save_build_lock(project_root: &Path, module_entries: &[(&str, Vec<BuildLockEntry>)]) {
+    let lock_path = project_root.join("nexa-build.lock");
+    let mut lock: BuildLockfile = fs::read_to_string(&lock_path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    lock.nexa_version = env!("CARGO_PKG_VERSION").to_string();
+    for (mod_name, entries) in module_entries {
+        lock.modules
+            .insert(mod_name.to_string(), entries.clone());
+    }
+    match serde_json::to_string_pretty::<BuildLockfile>(&lock) {
+        Ok(json) => {
+            if let Err(e) = fs::write(&lock_path, json) {
+                ui::warn(format!("could not write nexa-build.lock: {e}"));
+            }
+        }
+        Err(e) => ui::warn(format!("could not serialize nexa-build.lock: {e}")),
+    }
 }

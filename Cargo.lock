@@ -1717,6 +1717,7 @@ dependencies = [
  "console",
  "dialoguer",
  "ed25519-dalek",
+ "hex",
  "indicatif",
  "nexa-compiler",
  "nexa-server",

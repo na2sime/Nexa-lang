@@ -1,5 +1,6 @@
 pub mod codegen;
 pub mod lexer;
+pub mod lower;
 pub mod optimizer;
 pub mod packager;
 pub mod parser;

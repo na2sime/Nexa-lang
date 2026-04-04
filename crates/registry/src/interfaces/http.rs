@@ -39,8 +39,8 @@ pub fn build_router(state: AppState) -> Router {
             .expect("valid governor config"),
     );
     let auth_routes = Router::new()
-        .route("/auth/register", post(register))
-        .route("/auth/login", post(login))
+        .route("/v1/auth/register", post(register))
+        .route("/v1/auth/login", post(login))
         .layer(GovernorLayer {
             config: auth_limiter,
         });
@@ -51,16 +51,20 @@ pub fn build_router(state: AppState) -> Router {
         .allow_methods([Method::GET, Method::POST, Method::DELETE])
         .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE]);
 
+    let v1 = Router::new()
+        .route("/v1/auth/tokens", post(create_token).get(list_tokens))
+        .route("/v1/auth/tokens/:id", axum::routing::delete(revoke_token))
+        .route("/v1/packages", get(list_packages))
+        .route("/v1/packages/:name", get(get_package))
+        .route("/v1/packages/:name/publish", post(publish))
+        .route("/v1/packages/:name/:version/download", get(download))
+        .route("/v1/packages/:name/:version/source", get(get_source));
+
     Router::new()
         .merge(auth_routes)
+        .merge(v1)
+        // Health and UI are unversioned
         .route("/health", get(health))
-        .route("/auth/tokens", post(create_token).get(list_tokens))
-        .route("/auth/tokens/:id", axum::routing::delete(revoke_token))
-        .route("/packages", get(list_packages))
-        .route("/packages/:name", get(get_package))
-        .route("/packages/:name/publish", post(publish))
-        .route("/packages/:name/:version/download", get(download))
-        .route("/packages/:name/:version/source", get(get_source))
         .route("/ui/packages/:name", get(ui_package))
         .layer(cors)
         .layer(TraceLayer::new_for_http())
