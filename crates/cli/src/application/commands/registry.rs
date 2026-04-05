@@ -622,3 +622,342 @@ fn update_project_dependencies(
         let _ = fs::write(&path, updated);
     }
 }
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+    use tempfile::TempDir;
+
+    // Serialise tests that mutate env vars so they don't race.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    // ── Fixtures ──────────────────────────────────────────────────────────────
+
+    const MINIMAL_APP: &str = r#"app TestApp {
+    server { port: 3000; }
+    public window HomePage {
+        public render() => Component {
+            return Page { Text("Hello") };
+        }
+    }
+    route "/" => HomePage;
+}"#;
+
+    /// Build a minimal valid `.nexa` ZIP bundle in memory.
+    ///
+    /// The bundle contains `app.nxb`, `manifest.json`, `signature.sig`, and
+    /// `src/app.nx`.  The signature is a real SHA-256 over (nxb || manifest)
+    /// so that `verify_bundle_signature` passes.
+    fn build_test_bundle(name: &str, version: &str) -> Vec<u8> {
+        use sha2::{Digest, Sha256};
+        use std::io::Write as _;
+
+        let nxb_magic = b"NXB\x01\x00\x00\x00\x00";
+        let manifest = format!(
+            r#"{{"name":"{name}","version":"{version}","nexa_version":"0.1.0","nxb_version":1,"created_at":0}}"#
+        );
+        let mut hasher = Sha256::new();
+        hasher.update(nxb_magic);
+        hasher.update(manifest.as_bytes());
+        let signature = format!("{:x}", hasher.finalize());
+
+        let mut buf = Vec::new();
+        let cursor = std::io::Cursor::new(&mut buf);
+        let mut zip = zip::ZipWriter::new(cursor);
+        let opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+
+        zip.start_file("app.nxb", opts).unwrap();
+        zip.write_all(nxb_magic).unwrap();
+        zip.start_file("manifest.json", opts).unwrap();
+        zip.write_all(manifest.as_bytes()).unwrap();
+        zip.start_file("signature.sig", opts).unwrap();
+        zip.write_all(signature.as_bytes()).unwrap();
+        zip.start_file("src/app.nx", opts).unwrap();
+        zip.write_all(b"// source\n").unwrap();
+        zip.finish().unwrap();
+        buf
+    }
+
+    /// Create a minimal valid project layout in `dir`.
+    fn make_project(dir: &std::path::Path, registry_url: &str) {
+        fs::write(
+            dir.join("project.json"),
+            r#"{"name":"test-app","version":"0.1.0","author":"Test","modules":["core"]}"#,
+        )
+        .unwrap();
+        let yaml = format!(
+            "version: \"0.1\"\nmain_module: \"core\"\nregistry: \"{registry_url}\"\n"
+        );
+        fs::write(dir.join("nexa-compiler.yaml"), yaml).unwrap();
+
+        let src_main = dir.join("modules").join("core").join("src").join("main");
+        fs::create_dir_all(&src_main).unwrap();
+        fs::write(
+            dir.join("modules").join("core").join("module.json"),
+            r#"{"name":"core","main":"app.nx"}"#,
+        )
+        .unwrap();
+        fs::write(src_main.join("app.nx"), MINIMAL_APP).unwrap();
+    }
+
+    // ── install tests ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn install_downloads_and_extracts_package() {
+        let mut server = mockito::Server::new();
+        let bundle = build_test_bundle("test-pkg", "1.0.0");
+
+        let _m = server
+            .mock("GET", "/v1/packages/test-pkg/1.0.0/download")
+            .with_status(200)
+            .with_header("content-type", "application/octet-stream")
+            .with_body(bundle)
+            .create();
+
+        let tmp = TempDir::new().unwrap();
+        make_project(tmp.path(), &server.url());
+
+        install(
+            Some("test-pkg@1.0.0".to_string()),
+            Some(tmp.path().to_path_buf()),
+            None,
+        );
+
+        let pkg_dir = tmp.path().join("lib").join("test-pkg@1.0.0");
+        assert!(pkg_dir.exists(), "package directory not created");
+        assert!(pkg_dir.join("manifest.json").exists(), "manifest.json missing");
+        assert!(pkg_dir.join("app.nxb").exists(), "app.nxb missing");
+        assert!(pkg_dir.join("signature.sig").exists(), "signature.sig missing");
+    }
+
+    #[test]
+    fn install_creates_lockfile_entry() {
+        let mut server = mockito::Server::new();
+        let bundle = build_test_bundle("my-lib", "2.3.1");
+
+        let _m = server
+            .mock("GET", "/v1/packages/my-lib/2.3.1/download")
+            .with_status(200)
+            .with_header("content-type", "application/octet-stream")
+            .with_body(bundle)
+            .create();
+
+        let tmp = TempDir::new().unwrap();
+        make_project(tmp.path(), &server.url());
+
+        install(
+            Some("my-lib@2.3.1".to_string()),
+            Some(tmp.path().to_path_buf()),
+            None,
+        );
+
+        let lock_path = tmp.path().join("lib").join(".lock");
+        assert!(lock_path.exists(), ".lock file not created");
+        let lock: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&lock_path).unwrap()).unwrap();
+        let packages = lock["packages"].as_array().unwrap();
+        assert_eq!(packages.len(), 1);
+        assert_eq!(packages[0]["name"].as_str().unwrap(), "my-lib");
+        assert_eq!(packages[0]["version"].as_str().unwrap(), "2.3.1");
+    }
+
+    #[test]
+    fn install_updates_project_json_dependencies() {
+        let mut server = mockito::Server::new();
+        let bundle = build_test_bundle("ui-kit", "0.5.0");
+
+        let _m = server
+            .mock("GET", "/v1/packages/ui-kit/0.5.0/download")
+            .with_status(200)
+            .with_header("content-type", "application/octet-stream")
+            .with_body(bundle)
+            .create();
+
+        let tmp = TempDir::new().unwrap();
+        make_project(tmp.path(), &server.url());
+
+        install(
+            Some("ui-kit@0.5.0".to_string()),
+            Some(tmp.path().to_path_buf()),
+            None,
+        );
+
+        let pj: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(tmp.path().join("project.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            pj["dependencies"]["ui-kit"].as_str().unwrap(),
+            "0.5.0",
+            "project.json dependencies not updated"
+        );
+    }
+
+    #[test]
+    fn install_from_project_dependencies() {
+        let mut server = mockito::Server::new();
+        let bundle = build_test_bundle("core-utils", "1.0.0");
+
+        let _m = server
+            .mock("GET", "/v1/packages/core-utils/1.0.0/download")
+            .with_status(200)
+            .with_header("content-type", "application/octet-stream")
+            .with_body(bundle)
+            .create();
+
+        let tmp = TempDir::new().unwrap();
+        make_project(tmp.path(), &server.url());
+
+        // Write a dependency directly into project.json.
+        let pj_path = tmp.path().join("project.json");
+        let mut pj: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&pj_path).unwrap()).unwrap();
+        pj["dependencies"]["core-utils"] = serde_json::json!("1.0.0");
+        fs::write(&pj_path, serde_json::to_string_pretty(&pj).unwrap()).unwrap();
+
+        // install with no explicit package — should read from project.json.
+        install(None, Some(tmp.path().to_path_buf()), None);
+
+        let pkg_dir = tmp.path().join("lib").join("core-utils@1.0.0");
+        assert!(pkg_dir.exists(), "core-utils not installed from project dependencies");
+    }
+
+    #[test]
+    fn install_into_module_lib_dir() {
+        let mut server = mockito::Server::new();
+        let bundle = build_test_bundle("form-lib", "1.0.0");
+
+        let _m = server
+            .mock("GET", "/v1/packages/form-lib/1.0.0/download")
+            .with_status(200)
+            .with_header("content-type", "application/octet-stream")
+            .with_body(bundle)
+            .create();
+
+        let tmp = TempDir::new().unwrap();
+        make_project(tmp.path(), &server.url());
+
+        // Add a second module.
+        let api_src = tmp.path().join("modules").join("api").join("src").join("main");
+        fs::create_dir_all(&api_src).unwrap();
+        fs::write(
+            tmp.path().join("modules").join("api").join("module.json"),
+            r#"{"name":"api","main":"app.nx"}"#,
+        )
+        .unwrap();
+        fs::write(api_src.join("app.nx"), "").unwrap();
+        // Update project.json to include the api module.
+        let mut pj: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(tmp.path().join("project.json")).unwrap(),
+        )
+        .unwrap();
+        pj["modules"] = serde_json::json!(["core", "api"]);
+        fs::write(
+            tmp.path().join("project.json"),
+            serde_json::to_string_pretty(&pj).unwrap(),
+        )
+        .unwrap();
+
+        install(
+            Some("form-lib@1.0.0".to_string()),
+            Some(tmp.path().to_path_buf()),
+            Some("api".to_string()),
+        );
+
+        let pkg_dir = tmp
+            .path()
+            .join("modules")
+            .join("api")
+            .join("lib")
+            .join("form-lib@1.0.0");
+        assert!(pkg_dir.exists(), "form-lib not installed in api module lib dir");
+    }
+
+    // ── publish tests ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn publish_posts_bundle_to_registry() {
+        let _env_guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+        let mut server = mockito::Server::new();
+        let _m = server
+            .mock("POST", "/v1/packages/test-app-core/publish")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"id":"pkg-123","status":"ok"}"#)
+            .create();
+
+        let tmp = TempDir::new().unwrap();
+        make_project(tmp.path(), &server.url());
+
+        // Provide credentials via env var (CI-friendly path in credentials::load).
+        std::env::set_var("NEXA_TOKEN", "test-bearer-token");
+        std::env::set_var("NEXA_REGISTRY", &server.url());
+
+        publish(
+            Some(tmp.path().to_path_buf()),
+            None,
+            Some(server.url()),
+        );
+
+        std::env::remove_var("NEXA_TOKEN");
+        std::env::remove_var("NEXA_REGISTRY");
+
+        _m.assert();
+    }
+
+    #[test]
+    fn publish_posts_to_override_registry() {
+        let _env_guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+        let mut server = mockito::Server::new();
+        let _m = server
+            .mock("POST", "/v1/packages/test-app-core/publish")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"id":"pkg-456","status":"ok"}"#)
+            .create();
+
+        let tmp = TempDir::new().unwrap();
+        // Project uses a different default registry — the override should win.
+        make_project(tmp.path(), "https://registry.example.com");
+
+        std::env::set_var("NEXA_TOKEN", "test-bearer-token");
+        std::env::set_var("NEXA_REGISTRY", &server.url());
+
+        publish(
+            Some(tmp.path().to_path_buf()),
+            None,
+            Some(server.url()),
+        );
+
+        std::env::remove_var("NEXA_TOKEN");
+        std::env::remove_var("NEXA_REGISTRY");
+
+        _m.assert();
+    }
+
+    // ── Internal helper tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn verify_bundle_signature_accepts_valid_bundle() {
+        let bundle = build_test_bundle("my-pkg", "1.0.0");
+        // Should not panic or call process::exit.
+        verify_bundle_signature(&bundle, "my-pkg");
+    }
+
+    #[test]
+    fn extract_bundle_to_creates_all_files() {
+        let bundle = build_test_bundle("extract-test", "1.0.0");
+        let tmp = TempDir::new().unwrap();
+        extract_bundle_to(&bundle, tmp.path());
+        assert!(tmp.path().join("manifest.json").exists());
+        assert!(tmp.path().join("app.nxb").exists());
+        assert!(tmp.path().join("signature.sig").exists());
+        assert!(tmp.path().join("src").join("app.nx").exists());
+    }
+}

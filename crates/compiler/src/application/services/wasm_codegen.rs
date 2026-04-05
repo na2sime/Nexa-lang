@@ -1091,4 +1091,74 @@ mod tests {
             "constructor must load $self back from GC frame"
         );
     }
+
+    // ── CI WASM validation — wat2wasm + wasmtime ──────────────────────────────
+    //
+    // These tests call external tools (`wat2wasm` from wabt, `wasmtime`) to
+    // validate that generated WAT assembles to a legal WASM binary.
+    //
+    // In CI the tools are installed before the test suite runs (see
+    // `.github/workflows/snapshot.yml` step "Install wabt + wasmtime").
+    // Locally the tests skip gracefully if the tools are absent.
+
+    #[test]
+    fn validate_wasm_binary_counter() {
+        let wat_src = wat(&counter_ir());
+        assert_wat_assembles_and_validates(&wat_src, "counter");
+    }
+
+    #[test]
+    fn validate_wasm_binary_gc_v2() {
+        let wat_src = wat(&gc_v2_ir());
+        assert_wat_assembles_and_validates(&wat_src, "gc_v2");
+    }
+
+    /// Assemble `wat_src` with `wat2wasm --enable-bulk-memory`, then validate
+    /// the resulting binary with `wasmtime validate`.  If either tool is absent
+    /// the test is skipped (prints a notice and returns without failing).
+    fn assert_wat_assembles_and_validates(wat_src: &str, label: &str) {
+        use std::process::Command;
+
+        // Skip if wat2wasm is not installed.
+        if Command::new("wat2wasm").arg("--version").output().is_err() {
+            eprintln!(
+                "SKIP {label}: `wat2wasm` not found — install wabt to enable this test"
+            );
+            return;
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let wat_path  = dir.path().join(format!("{label}.wat"));
+        let wasm_path = dir.path().join(format!("{label}.wasm"));
+
+        std::fs::write(&wat_path, wat_src).expect("write .wat");
+
+        let assemble = Command::new("wat2wasm")
+            .args(["--enable-bulk-memory", "--enable-memory64"])
+            .arg(&wat_path)
+            .arg("-o")
+            .arg(&wasm_path)
+            .output()
+            .expect("run wat2wasm");
+
+        assert!(
+            assemble.status.success(),
+            "wat2wasm failed for '{label}':\n{}",
+            String::from_utf8_lossy(&assemble.stderr)
+        );
+
+        // Validate binary if wasmtime is installed.
+        if Command::new("wasmtime").arg("--version").output().is_ok() {
+            let validate = Command::new("wasmtime")
+                .arg("validate")
+                .arg(&wasm_path)
+                .output()
+                .expect("run wasmtime");
+            assert!(
+                validate.status.success(),
+                "wasmtime validate rejected '{label}':\n{}",
+                String::from_utf8_lossy(&validate.stderr)
+            );
+        }
+    }
 }
