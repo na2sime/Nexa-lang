@@ -20,6 +20,7 @@ pub use application::services::packager::{decode_nxb, PackageError};
 pub use application::services::parser::Parser;
 pub use application::services::resolver::Resolver;
 pub use application::services::semantic::SemanticAnalyzer;
+pub use application::services::codegen_rust::{RustCodegen, RustCodegenError, RustCodegenResult};
 pub use application::services::wasm_codegen::{WasmCodegen, WasmCodegenError};
 pub use domain::ir::IrModule;
 

@@ -1,4 +1,5 @@
 pub mod codegen;
+pub mod codegen_rust;
 pub mod lexer;
 pub mod lower;
 pub mod optimizer;
