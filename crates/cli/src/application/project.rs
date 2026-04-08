@@ -1,5 +1,62 @@
 use serde::Deserialize;
 use std::collections::HashMap;
+
+// ── App types ─────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum AppType {
+    #[default]
+    Web,
+    Backend,
+    Cli,
+    Desktop,
+    Package,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum Platform {
+    Browser,
+    Native,
+    NativeMacos,
+    NativeWindows,
+    NativeLinux,
+    Macos,
+    Windows,
+    Linux,
+    Ios,
+    Android,
+}
+
+impl Platform {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Platform::Browser       => "browser",
+            Platform::Native        => "native",
+            Platform::NativeMacos   => "native-macos",
+            Platform::NativeWindows => "native-windows",
+            Platform::NativeLinux   => "native-linux",
+            Platform::Macos         => "macos",
+            Platform::Windows       => "windows",
+            Platform::Linux         => "linux",
+            Platform::Ios           => "ios",
+            Platform::Android       => "android",
+        }
+    }
+}
+
+fn default_true() -> bool { true }
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct DesktopConfig {
+    pub title: String,
+    pub width: u32,
+    pub height: u32,
+    #[serde(default = "default_true")]
+    pub resizable: bool,
+    pub icon: Option<String>,
+}
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -74,6 +131,28 @@ pub struct ModuleConfig {
     /// Module-specific dependencies (installed in `modules/<name>/lib/`).
     #[serde(default)]
     pub dependencies: HashMap<String, String>,
+
+    // ── Multi-target fields ───────────────────────────────────────────────────
+    #[serde(default, rename = "type")]
+    pub app_type: AppType,
+    #[serde(default)]
+    pub platforms: Vec<Platform>,
+    pub desktop: Option<DesktopConfig>,
+    pub version: Option<String>,
+}
+
+impl ModuleConfig {
+    pub fn effective_platforms(&self) -> Vec<Platform> {
+        if !self.platforms.is_empty() {
+            return self.platforms.clone();
+        }
+        match self.app_type {
+            AppType::Web                    => vec![Platform::Browser],
+            AppType::Backend | AppType::Cli => vec![Platform::Native],
+            AppType::Desktop                => vec![Platform::Macos],
+            AppType::Package                => vec![],
+        }
+    }
 }
 
 /// A private registry declared in `nexa-compiler.yaml`.
@@ -314,6 +393,32 @@ impl NexaProject {
     #[allow(dead_code)]
     pub fn nexa_cache_dir(&self, name: &str) -> PathBuf {
         self.root.join(".nexa").join(name)
+    }
+
+    /// Returns `<root>/.nexa/nex_out/<module>/<platform>/` — intermediate Rust sources.
+    pub fn nex_out_dir(&self, module: &str, platform: &Platform) -> PathBuf {
+        self.root
+            .join(".nexa")
+            .join("nex_out")
+            .join(module)
+            .join(platform.as_str())
+    }
+
+    /// Returns `<root>/.nexa/compile/logs/<module>-<platform>.log` — compile log path.
+    pub fn compile_log_path(&self, module: &str, platform: &Platform) -> PathBuf {
+        self.root
+            .join(".nexa")
+            .join("compile")
+            .join("logs")
+            .join(format!("{}-{}.log", module, platform.as_str()))
+    }
+
+    /// Returns `<root>/dist/<module>/<platform>/` — per-platform build output.
+    pub fn dist_platform_dir(&self, module: &str, platform: &Platform) -> PathBuf {
+        self.root
+            .join("dist")
+            .join(module)
+            .join(platform.as_str())
     }
 
     // ── Main module shortcuts ─────────────────────────────────────────────────
@@ -584,5 +689,74 @@ mod tests {
         .unwrap();
         let err = NexaProject::load(tmp.path()).unwrap_err();
         assert!(matches!(err, ProjectError::MissingModuleEntryFile(..)));
+    }
+
+    #[test]
+    fn parse_module_config_type_backend() {
+        let json = r#"{"name":"api","main":"app.nx","type":"backend"}"#;
+        let cfg = parse_module_config(json, "api").unwrap();
+        assert_eq!(cfg.app_type, AppType::Backend);
+    }
+
+    #[test]
+    fn parse_module_config_type_defaults_to_web() {
+        let json = r#"{"name":"core","main":"app.nx"}"#;
+        let cfg = parse_module_config(json, "core").unwrap();
+        assert_eq!(cfg.app_type, AppType::Web);
+    }
+
+    #[test]
+    fn parse_module_config_platforms() {
+        let json = r#"{"name":"api","main":"app.nx","type":"backend","platforms":["native-linux","native-macos"]}"#;
+        let cfg = parse_module_config(json, "api").unwrap();
+        assert_eq!(cfg.platforms, vec![Platform::NativeLinux, Platform::NativeMacos]);
+    }
+
+    #[test]
+    fn effective_platforms_backend_default() {
+        let json = r#"{"name":"api","main":"app.nx","type":"backend"}"#;
+        let cfg = parse_module_config(json, "api").unwrap();
+        assert_eq!(cfg.effective_platforms(), vec![Platform::Native]);
+    }
+
+    #[test]
+    fn effective_platforms_web_default() {
+        let json = r#"{"name":"core","main":"app.nx"}"#;
+        let cfg = parse_module_config(json, "core").unwrap();
+        assert_eq!(cfg.effective_platforms(), vec![Platform::Browser]);
+    }
+
+    #[test]
+    fn effective_platforms_explicit_overrides_default() {
+        let json = r#"{"name":"api","main":"app.nx","type":"backend","platforms":["native-linux"]}"#;
+        let cfg = parse_module_config(json, "api").unwrap();
+        assert_eq!(cfg.effective_platforms(), vec![Platform::NativeLinux]);
+    }
+
+    #[test]
+    fn effective_platforms_package_empty() {
+        let json = r#"{"name":"lib","main":"lib.nx","type":"package","version":"1.0.0"}"#;
+        let cfg = parse_module_config(json, "lib").unwrap();
+        assert!(cfg.effective_platforms().is_empty());
+    }
+
+    #[test]
+    fn platform_as_str_roundtrip() {
+        assert_eq!(Platform::Browser.as_str(), "browser");
+        assert_eq!(Platform::NativeLinux.as_str(), "native-linux");
+        assert_eq!(Platform::Macos.as_str(), "macos");
+    }
+
+    #[test]
+    fn parse_module_config_desktop_config() {
+        let json = r#"{
+            "name":"app","main":"app.nx","type":"desktop",
+            "desktop":{"title":"MyApp","width":1200,"height":800}
+        }"#;
+        let cfg = parse_module_config(json, "app").unwrap();
+        let desktop = cfg.desktop.unwrap();
+        assert_eq!(desktop.title, "MyApp");
+        assert_eq!(desktop.width, 1200);
+        assert!(desktop.resizable); // default true
     }
 }
