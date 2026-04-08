@@ -1,5 +1,9 @@
 use super::load_project;
-use crate::application::{project::NexaProject, updater};
+use crate::application::{
+    project::NexaProject,
+    targets::dispatcher::build_module,
+    updater,
+};
 use crate::infrastructure::ui;
 // nexa_compiler is an internal workspace crate; see its lib.rs for the semver-exempt notice.
 use nexa_compiler::{compile_project_file, compile_to_bundle, decode_nxb, CodeGenerator};
@@ -39,26 +43,61 @@ pub fn build(project_dir: Option<PathBuf>) {
         let current_sources =
             fingerprint_module_sources(&proj.module_src_root(mod_name), proj.root());
 
-        if is_module_up_to_date(&existing_lock, mod_name, &current_sources, &proj.dist_dir(mod_name)) {
+        // Determine the representative dist dir for the up-to-date check.
+        // For modules with effective platforms we use the first platform's dir;
+        // fall back to the legacy dist_dir when no platforms are configured.
+        let module_cfg = proj.modules.get(mod_name.as_str());
+        let check_dist_dir = module_cfg
+            .and_then(|m| m.effective_platforms().into_iter().next())
+            .map(|p| proj.dist_platform_dir(mod_name, &p))
+            .unwrap_or_else(|| proj.dist_dir(mod_name));
+
+        if is_module_up_to_date(&existing_lock, mod_name, &current_sources, &check_dist_dir) {
             lock_entries.push((mod_name.clone(), current_sources));
             skipped += 1;
             pb.inc(1);
             continue;
         }
 
-        match compile_project_file(
-            &proj.module_entry(mod_name),
-            &proj.module_src_root(mod_name),
-            proj.root(),
-            mod_name,
-        ) {
-            Ok(result) => {
-                write_dist_inner(&proj.dist_dir(mod_name), result, mod_name);
-                lock_entries.push((mod_name.clone(), current_sources));
-                compiled += 1;
-                pb.inc(1);
+        let entry = proj.module_entry(mod_name);
+        let results = match module_cfg {
+            Some(cfg) => build_module(&proj, cfg, &entry),
+            // Fallback: no module config in memory — compile directly (should not happen
+            // for a valid project, but keeps the build from panicking).
+            None => {
+                match compile_project_file(
+                    &entry,
+                    &proj.module_src_root(mod_name),
+                    proj.root(),
+                    mod_name,
+                ) {
+                    Ok(result) => {
+                        write_dist_inner(&proj.dist_dir(mod_name), result, mod_name);
+                        lock_entries.push((mod_name.clone(), current_sources));
+                        compiled += 1;
+                        pb.inc(1);
+                        continue;
+                    }
+                    Err(e) => {
+                        ui::bar_fail(&pb, e.to_string());
+                    }
+                }
             }
-            Err(e) => ui::bar_fail(&pb, e.to_string()),
+        };
+
+        let mut build_ok = true;
+        for result in &results {
+            if let Err(e) = result {
+                ui::error(format!("{mod_name}: {e}"));
+                build_ok = false;
+            }
+        }
+        if build_ok {
+            lock_entries.push((mod_name.clone(), current_sources));
+            compiled += 1;
+            pb.inc(1);
+        } else {
+            pb.abandon();
         }
     }
 
@@ -887,5 +926,72 @@ mod tests {
         let lock: BuildLockfile = serde_json::from_str(&raw).unwrap();
         assert!(lock.modules.contains_key("core"), "core entries should be preserved");
         assert!(lock.modules.contains_key("api"), "api entries should be added");
+    }
+
+    // ── dispatcher integration ────────────────────────────────────────────────
+
+    /// A default web module (`AppType::Web`) compiled through `build_module` via
+    /// the dispatcher should produce `dist/<module>/browser/app.js` and
+    /// `dist/<module>/browser/index.html`.
+    #[test]
+    fn dispatcher_web_module_writes_browser_dist() {
+        use crate::application::targets::dispatcher::build_module;
+        use crate::application::project::NexaProject;
+
+        let tmp = TempDir::new().unwrap();
+
+        // Minimal valid web project layout.
+        fs::write(
+            tmp.path().join("project.json"),
+            r#"{"name":"disp-test","version":"0.1.0","author":"Test","modules":["core"]}"#,
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("nexa-compiler.yaml"),
+            "version: \"0.1\"\nmain_module: \"core\"\n",
+        )
+        .unwrap();
+        let src_main = tmp
+            .path()
+            .join("modules")
+            .join("core")
+            .join("src")
+            .join("main");
+        fs::create_dir_all(&src_main).unwrap();
+        fs::write(
+            tmp.path().join("modules").join("core").join("module.json"),
+            r#"{"name":"core","main":"app.nx"}"#,
+        )
+        .unwrap();
+        fs::write(
+            src_main.join("app.nx"),
+            "app App {\n  server { port: 3000; }\n  public window HomePage {\n    public render() => Component {\n      return Page { Text(\"Hello\") };\n    }\n  }\n  route \"/\" => HomePage;\n}\n",
+        )
+        .unwrap();
+
+        let proj = NexaProject::load(tmp.path()).unwrap();
+        let module_cfg = proj.modules.get("core").unwrap();
+        let entry = proj.module_entry("core");
+
+        let results = build_module(&proj, module_cfg, &entry);
+
+        // There should be exactly one result for a web module (browser platform).
+        assert_eq!(results.len(), 1, "web module should produce one build result");
+        assert!(
+            results[0].is_ok(),
+            "web module build should succeed: {:?}",
+            results[0]
+        );
+
+        // Output files must exist in dist/core/browser/.
+        let browser_dist = tmp.path().join("dist").join("core").join("browser");
+        assert!(
+            browser_dist.join("app.js").exists(),
+            "dist/core/browser/app.js should exist after dispatcher build"
+        );
+        assert!(
+            browser_dist.join("index.html").exists(),
+            "dist/core/browser/index.html should exist after dispatcher build"
+        );
     }
 }

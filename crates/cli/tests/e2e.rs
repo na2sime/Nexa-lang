@@ -143,9 +143,10 @@ fn init_gitignore_excludes_lib_and_dist() {
 
 // ── nexa build ───────────────────────────────────────────────────────────────
 
-/// The dist dir is `<project_root>/dist/<module_name>/`.
+/// The dist dir for web modules is `<project_root>/dist/<module_name>/browser/`
+/// (dispatcher routes web targets to the browser platform sub-directory).
 fn dist_dir(proj_dir: &Path, module: &str) -> PathBuf {
-    proj_dir.join("dist").join(module)
+    proj_dir.join("dist").join(module).join("browser")
 }
 
 #[test]
@@ -157,7 +158,7 @@ fn build_compiles_default_module() {
     nexa_ok(&proj_dir, &["build"]);
 
     let dist = dist_dir(&proj_dir, "core");
-    assert!(dist.join("app.js").exists(), "dist/core/app.js not produced after build");
+    assert!(dist.join("app.js").exists(), "dist/core/browser/app.js not produced after build");
 }
 
 #[test]
@@ -171,7 +172,7 @@ fn build_produces_index_html() {
     let dist = dist_dir(&proj_dir, "core");
     assert!(
         dist.join("index.html").exists(),
-        "dist/core/index.html not produced after build"
+        "dist/core/browser/index.html not produced after build"
     );
 }
 
