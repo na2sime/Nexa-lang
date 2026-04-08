@@ -21,6 +21,7 @@ pub use application::services::parser::Parser;
 pub use application::services::resolver::Resolver;
 pub use application::services::semantic::SemanticAnalyzer;
 pub use application::services::wasm_codegen::{WasmCodegen, WasmCodegenError};
+pub use domain::ir::IrModule;
 
 use crate::domain::span::Span;
 use std::{fmt, path::Path};
@@ -421,6 +422,73 @@ pub fn compile_to_wasm(
         })?;
 
     Ok(WasmCompileResult { wat })
+}
+
+/// Compile a `.nx` file in a structured project to an [`IrModule`].
+///
+/// Pipeline: Lex → Parse → Resolve → SemanticAnalyzer → Lower (IR).
+/// The IR is target-agnostic — use it to drive any backend (Rust, WASM, etc.).
+#[allow(clippy::result_large_err)]
+pub fn compile_to_ir(
+    entry: &Path,
+    src_root: &Path,
+    project_root: &Path,
+    module_name: &str,
+) -> Result<domain::ir::IrModule, CompileError> {
+    let source = std::fs::read_to_string(entry).map_err(|e| CompileError {
+        span: Span::dummy(),
+        kind: CompileErrorKind::Resolve(application::services::resolver::ResolveError::Io(
+            entry.display().to_string(),
+            e,
+        )),
+        file: Some(entry.display().to_string()),
+        source: None,
+    })?;
+
+    let file = entry.display().to_string();
+    let src = source.clone();
+
+    let tokens = application::services::lexer::Lexer::new(&source)
+        .tokenize()
+        .map_err(|e| CompileError {
+            span: e.span(),
+            kind: CompileErrorKind::Lex(e),
+            file: Some(file.clone()),
+            source: Some(src.clone()),
+        })?;
+
+    let program = application::services::parser::Parser::new(tokens)
+        .parse()
+        .map_err(|e| CompileError {
+            span: e.span(),
+            kind: CompileErrorKind::Parse(e),
+            file: Some(file.clone()),
+            source: Some(src.clone()),
+        })?;
+
+    let resolved = application::services::resolver::Resolver::new(
+        src_root,
+        project_root,
+        module_name,
+        infrastructure::fs_source::FsSourceProvider,
+    )
+    .resolve(&program, entry)
+    .map_err(|e| CompileError {
+        span: Span::dummy(),
+        kind: CompileErrorKind::Resolve(e),
+        file: Some(file.clone()),
+        source: None,
+    })?;
+
+    let mut analyzer = application::services::semantic::SemanticAnalyzer::new();
+    analyzer.analyze(&resolved).map_err(|e| CompileError {
+        span: e.span(),
+        kind: CompileErrorKind::Semantic(e),
+        file: Some(file.clone()),
+        source: Some(src.clone()),
+    })?;
+
+    Ok(application::services::lower::lower(&resolved))
 }
 
 /// Compile from a string (no import resolution).
@@ -864,5 +932,26 @@ public class Foo {
         let p = parser.parse_lib().unwrap();
         assert!(parser.collected_errors().is_empty(), "valid code should produce no collected errors");
         assert_eq!(p.declarations.len(), 1);
+    }
+
+    #[test]
+    fn compile_to_ir_extracts_class_from_backend_app() {
+        let src = r#"app MyCli {
+    class MyCli {
+        main() => Void {
+            let x: Int = 42;
+            return;
+        }
+    }
+}"#;
+        let tmp = tempfile::tempdir().unwrap();
+        let entry = tmp.path().join("app.nx");
+        std::fs::write(&entry, src).unwrap();
+        let ir = compile_to_ir(&entry, tmp.path(), tmp.path(), "core").unwrap();
+        assert_eq!(ir.name, "MyCli");
+        assert!(!ir.classes.is_empty(), "should have at least one class");
+        let cls = &ir.classes[0];
+        assert_eq!(cls.name, "MyCli");
+        assert!(cls.methods.iter().any(|m| m.name == "main"), "should have main() method");
     }
 }
