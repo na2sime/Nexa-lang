@@ -1,7 +1,15 @@
+use super::module::{build_module_json, parse_app_type};
+use crate::application::project::AppType;
 use crate::infrastructure::ui;
 use std::{fs, path::Path, path::PathBuf};
 
-pub fn init(name: Option<String>, author: Option<String>, version: String, no_git: bool) {
+pub fn init(
+    name: Option<String>,
+    author: Option<String>,
+    version: String,
+    no_git: bool,
+    module_type: String,
+) {
     let project_name = name.clone().unwrap_or_else(|| {
         std::env::current_dir()
             .ok()
@@ -42,7 +50,8 @@ pub fn init(name: Option<String>, author: Option<String>, version: String, no_gi
             .unwrap_or_else(|| "Unknown".to_string())
     });
 
-    create_project_files(&root, &project_name, &author_str, &version);
+    let app_type = parse_app_type(&module_type);
+    create_project_files(&root, &project_name, &author_str, &version, &app_type);
 
     let git_initted = if !no_git {
         std::process::Command::new("git")
@@ -91,7 +100,13 @@ pub fn init(name: Option<String>, author: Option<String>, version: String, no_gi
 
 /// Create all project files and directories under `root`.
 /// Extracted for unit-testability — `init()` delegates here after resolving paths/author.
-fn create_project_files(root: &Path, project_name: &str, author: &str, version: &str) {
+fn create_project_files(
+    root: &Path,
+    project_name: &str,
+    author: &str,
+    version: &str,
+    app_type: &AppType,
+) {
     let core_src_main = root.join("modules").join("core").join("src").join("main");
     let core_src_test = root.join("modules").join("core").join("src").join("test");
     fs::create_dir_all(&core_src_main)
@@ -114,15 +129,10 @@ fn create_project_files(root: &Path, project_name: &str, author: &str, version: 
     );
     write_file(&root.join("project.json"), &project_json);
 
-    let module_json = r#"{
-  "name": "core",
-  "main": "app.nx",
-  "dependencies": {}
-}
-"#;
+    let module_json = build_module_json("core", app_type, &[]);
     write_file(
         &root.join("modules").join("core").join("module.json"),
-        module_json,
+        &module_json,
     );
 
     let compiler_yaml = r#"version: "0.1"
@@ -201,6 +211,7 @@ pub(super) fn to_pascal_case(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::application::project::AppType;
     use std::fs;
     use tempfile::TempDir;
 
@@ -219,7 +230,7 @@ mod tests {
     #[test]
     fn creates_expected_directory_structure() {
         let tmp = TempDir::new().unwrap();
-        create_project_files(tmp.path(), "my-app", "Dev", "0.1.0");
+        create_project_files(tmp.path(), "my-app", "Dev", "0.1.0", &AppType::Web);
 
         assert!(tmp.path().join("project.json").exists());
         assert!(tmp.path().join("nexa-compiler.yaml").exists());
@@ -250,7 +261,7 @@ mod tests {
     #[test]
     fn project_json_has_correct_content() {
         let tmp = TempDir::new().unwrap();
-        create_project_files(tmp.path(), "my-app", "Alice", "1.2.3");
+        create_project_files(tmp.path(), "my-app", "Alice", "1.2.3", &AppType::Web);
 
         let raw = fs::read_to_string(tmp.path().join("project.json")).unwrap();
         let val: serde_json::Value = serde_json::from_str(&raw).unwrap();
@@ -266,7 +277,7 @@ mod tests {
     #[test]
     fn module_json_has_correct_content() {
         let tmp = TempDir::new().unwrap();
-        create_project_files(tmp.path(), "proj", "Dev", "0.1.0");
+        create_project_files(tmp.path(), "proj", "Dev", "0.1.0", &AppType::Web);
 
         let raw = fs::read_to_string(
             tmp.path().join("modules").join("core").join("module.json"),
@@ -280,7 +291,7 @@ mod tests {
     #[test]
     fn compiler_yaml_has_correct_content() {
         let tmp = TempDir::new().unwrap();
-        create_project_files(tmp.path(), "proj", "Dev", "0.1.0");
+        create_project_files(tmp.path(), "proj", "Dev", "0.1.0", &AppType::Web);
 
         let raw = fs::read_to_string(tmp.path().join("nexa-compiler.yaml")).unwrap();
         assert!(raw.contains("main_module: \"core\""));
@@ -290,7 +301,7 @@ mod tests {
     #[test]
     fn app_nx_uses_pascal_case_class_name() {
         let tmp = TempDir::new().unwrap();
-        create_project_files(tmp.path(), "my-cool-app", "Dev", "0.1.0");
+        create_project_files(tmp.path(), "my-cool-app", "Dev", "0.1.0", &AppType::Web);
 
         let raw = fs::read_to_string(
             tmp.path()
@@ -308,12 +319,49 @@ mod tests {
     #[test]
     fn gitignore_excludes_build_artifacts() {
         let tmp = TempDir::new().unwrap();
-        create_project_files(tmp.path(), "proj", "Dev", "0.1.0");
+        create_project_files(tmp.path(), "proj", "Dev", "0.1.0", &AppType::Web);
 
         let raw = fs::read_to_string(tmp.path().join(".gitignore")).unwrap();
         assert!(raw.contains("lib/"));
         assert!(raw.contains("modules/*/lib/"));
         assert!(raw.contains("*.nexa"));
         assert!(raw.contains(".env"));
+    }
+
+    // ── Task 7 — --type flag tests ────────────────────────────────────────────
+
+    /// `nexa new my-app` (no --type, defaults to "web") → module.json has no "type" field (backward compat).
+    #[test]
+    fn init_default_web_omits_type_field_in_module_json() {
+        let tmp = TempDir::new().unwrap();
+        create_project_files(tmp.path(), "my-app", "Dev", "0.1.0", &AppType::Web);
+
+        let raw = fs::read_to_string(
+            tmp.path().join("modules").join("core").join("module.json"),
+        )
+        .unwrap();
+        let val: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert!(
+            val.get("type").is_none(),
+            "type field must be absent for default web projects (backward compat)"
+        );
+    }
+
+    /// `nexa new my-backend --type backend` → module.json has `"type": "backend"`.
+    #[test]
+    fn init_backend_type_writes_type_field_in_module_json() {
+        let tmp = TempDir::new().unwrap();
+        create_project_files(tmp.path(), "my-backend", "Dev", "0.1.0", &AppType::Backend);
+
+        let raw = fs::read_to_string(
+            tmp.path().join("modules").join("core").join("module.json"),
+        )
+        .unwrap();
+        let val: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(
+            val["type"].as_str(),
+            Some("backend"),
+            "module.json should contain \"type\": \"backend\""
+        );
     }
 }

@@ -35,6 +35,9 @@ enum Commands {
         /// Do not initialise a git repository
         #[arg(long)]
         no_git: bool,
+        /// Initial module type: web | backend | cli | desktop | package (default: web)
+        #[arg(long = "type", value_name = "TYPE", default_value = "web")]
+        module_type: String,
     },
 
     /// Compile the project and start the dev server (also accepts a .nexa bundle)
@@ -293,7 +296,8 @@ pub async fn run() {
             author,
             version,
             no_git,
-        } => commands::init(name, author, version, no_git),
+            module_type,
+        } => commands::init(name, author, version, no_git, module_type),
 
         Commands::Run {
             bundle,

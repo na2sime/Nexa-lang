@@ -155,7 +155,7 @@ app {app} {{
 /// The `"type"` field is omitted when the type is `Web` (the default) and
 /// `"platforms"` is omitted when the list is empty — both for backward
 /// compatibility with projects that do not use multi-target features.
-fn build_module_json(name: &str, app_type: &AppType, platforms: &[Platform]) -> String {
+pub(crate) fn build_module_json(name: &str, app_type: &AppType, platforms: &[Platform]) -> String {
     #[derive(Serialize)]
     struct ModuleJson<'a> {
         name: &'a str,
