@@ -1,6 +1,6 @@
 use super::load_project;
 use crate::application::{
-    project::NexaProject,
+    project::{AppType, NexaProject},
     targets::dispatcher::build_module,
     updater,
 };
@@ -44,14 +44,20 @@ pub fn build(project_dir: Option<PathBuf>) {
         let current_sources =
             fingerprint_module_sources(&proj.module_src_root(mod_name), proj.root());
 
-        // Determine the representative dist dir for the up-to-date check.
-        // For modules with effective platforms we use the first platform's dir;
-        // fall back to the legacy dist_dir when no platforms are configured.
+        // Determine the representative output dir for the up-to-date check.
+        // Web/Package → dist/<mod>/browser/  (contains app.js + index.html)
+        // Backend/CLI → .nexa/nex_out/<mod>/ (contains main.rs + Cargo.toml)
+        // Desktop / unknown → dist/<mod>/
         let module_cfg = proj.modules.get(mod_name.as_str());
-        let check_dist_dir = module_cfg
-            .and_then(|m| m.effective_platforms().into_iter().next())
-            .map(|p| proj.dist_platform_dir(mod_name, &p))
-            .unwrap_or_else(|| proj.dist_dir(mod_name));
+        let check_dist_dir = match module_cfg.map(|m| &m.app_type) {
+            Some(AppType::Backend) | Some(AppType::Cli) => {
+                proj.root().join(".nexa").join("nex_out").join(mod_name)
+            }
+            _ => module_cfg
+                .and_then(|m| m.effective_platforms().into_iter().next())
+                .map(|p| proj.dist_platform_dir(mod_name, &p))
+                .unwrap_or_else(|| proj.dist_dir(mod_name)),
+        };
 
         if is_module_up_to_date(&existing_lock, mod_name, &current_sources, &check_dist_dir) {
             lock_entries.push((mod_name.clone(), current_sources));
@@ -430,15 +436,20 @@ pub(super) fn load_build_lock(project_root: &Path) -> BuildLockfile {
 /// A module is considered up to date when ALL of the following hold:
 ///   1. The lock contains an entry for this module.
 ///   2. The current source fingerprints are identical to the locked fingerprints.
-///   3. The compiled output (`app.js`) exists in `dist_dir` — prevents skipping
-///      when someone manually deletes the dist output.
+///   3. The output directory exists and is non-empty — prevents skipping when
+///      someone manually deletes the dist/nex_out output.
 pub(super) fn is_module_up_to_date(
     lock: &BuildLockfile,
     mod_name: &str,
     current: &[BuildLockEntry],
     dist_dir: &Path,
 ) -> bool {
-    if !dist_dir.join("app.js").exists() {
+    // The output directory must exist and contain at least one file.
+    let output_present = dist_dir
+        .read_dir()
+        .map(|mut d| d.next().is_some())
+        .unwrap_or(false);
+    if !output_present {
         return false;
     }
     match lock.modules.get(mod_name) {
