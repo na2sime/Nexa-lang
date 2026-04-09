@@ -1,5 +1,6 @@
 {
   "name": "core",
+  "type": "web",
   "main": "app.nx",
   "dependencies": {}
 }

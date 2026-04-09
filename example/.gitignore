@@ -1,6 +1,7 @@
 # Nexa compiler output
 dist/
-.nexa/
+.nexa/nex_out/
+.nexa/compile/logs/
 
 # Installed packages (project-level and module-level)
 lib/
